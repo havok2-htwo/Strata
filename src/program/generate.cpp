@@ -4345,9 +4345,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: WARNING: --batch %d is off: %s\n", o.batch, off);
             o.batch = 0;
         } else if (o.batch > cap && !batch_mtp) {
-            std::fprintf(stderr, "strata generate: WARNING: --batch %d: a batch window holds at most %d rows, so %d "
-                                 "slots\n", o.batch, cap, cap);
-            o.batch = cap;
+            // g3: with a layer split the slots flow through the stages in groups, and a group's window holds
+            // batch / groups rows - so up to cap rows per group, one group per stage, i.e. cap * stages slots
+            const int pipe_cap = !stages.empty() && !(o.batch_groups_set && !o.batch_groups_auto && o.batch_groups == 1) ? cap * (int) (stages.size() + 1) : cap;
+            if (o.batch > pipe_cap) {
+                std::fprintf(stderr, "strata generate: WARNING: --batch %d: a batch window holds at most %d rows, so %d "
+                                     "slots\n", o.batch, cap, pipe_cap);
+                o.batch = pipe_cap;
+            }
+            if (o.batch > cap)
+                std::fprintf(stderr, "strata generate: --batch %d over %d stages (g3 patch: up to %d rows per group "
+                                     "window)\n", o.batch, (int) stages.size() + 1, cap);
         }
     }
     // --batch-groups auto: the pipeline needs one group per GPU stage to keep every card busy (4 x R9700, 8 clients:
@@ -4370,6 +4378,13 @@ int main(int argc, char** argv) {
                          r.groups == 1 ? "" : "s", o.batch / r.groups, o.batch / r.groups == 1 ? "" : "s");
     };
     if (o.batch > 0) resolve_groups_auto();
+    if (o.batch > strata::kernels::kVerifyMaxT && !batch_mtp &&
+        (o.batch_groups < 2 || o.batch / std::max(o.batch_groups, 1) > strata::kernels::kVerifyMaxT)) {
+        const int g_ = std::max(o.batch_groups, 1), keep = strata::kernels::kVerifyMaxT * g_;
+        std::fprintf(stderr, "strata generate: WARNING: --batch %d in %d group%s exceeds %d rows per window: %d slots\n",
+                     o.batch, g_, g_ == 1 ? "" : "s", (int) strata::kernels::kVerifyMaxT, keep);
+        o.batch = keep;
+    }
     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
         std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
                              "one group\n", o.batch_groups, o.batch);
@@ -7426,8 +7441,10 @@ int main(int argc, char** argv) {
                 }
         }
         if (n_stages > 1) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
-                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            // g3: pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
+            // kVerifyMaxT slots the hand-off must hold one row per slot
+            const int hrows = std::max<int>(strata::kernels::kVerifyMaxT, o.batch);
+            const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
             for (float*& h : hand) {
                 float* hh = nullptr;
@@ -7443,6 +7460,7 @@ int main(int argc, char** argv) {
             for (int st = 0; st < n_stages; ++st) {
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                         st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                if (hrows > strata::kernels::kVerifyMaxT) stage_ver(st).set_handoff_rows(hrows);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
@@ -7451,7 +7469,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err);
+                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
@@ -7467,7 +7485,8 @@ int main(int argc, char** argv) {
                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
-                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
+                                       batch_mtp ? strata::kernels::kVerifyMaxT
+                                                 : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -7537,7 +7556,7 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());

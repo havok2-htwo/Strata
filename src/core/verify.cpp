@@ -2760,9 +2760,9 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
                            std::string& err) {
     using namespace strata::kernels;
     // the row layout: a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split,
-    // whose hand-off buffers hold kVerifyMaxT rows (a stage that hands rows on or takes them)
+    // whose hand-off buffers hold kVerifyMaxT rows, or set_handoff_rows' (a stage that hands rows on or takes them)
     if (const char* why = batch_rows_error(rows, S, pos, (int) slots_.size(), max_t_, hbase,
-                                           next_ != nullptr || lb_ > 0, kVerifyMaxT)) {
+                                           next_ != nullptr || lb_ > 0, handoff_rows_ > 0 ? handoff_rows_ : kVerifyMaxT)) {
         err = why;
         return false;
     }
