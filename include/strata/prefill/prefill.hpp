@@ -16,6 +16,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -192,7 +193,23 @@ public:
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
 
+    /// The device `init` ran on (-1 before it).
+    int device() const;
+    /// STRATA_PIPE_OVERLAP: may this prompt path and the stages after it read a prompt while the batch slots' windows
+    /// run on the same cards?  Only where the read shares nothing the windows write or read as changing: no
+    /// --peer-device peer or stage helper (STRATA_PREFILL_HELP), no CPU pool, buffers of its own (not lent cache
+    /// slots), no K/V streaming, and the PLE block batched (the per-token block writes the session's PLE scratch,
+    /// which the stage-0 windows use too).  False with `why`.
+    bool overlap_safe(std::string& why) const;
+    /// The first CUDA error a later stage's thread had after one of its chunks since the last `run` (0: none).  A
+    /// stage's chunks run on threads of their own, which take their error state with them; only a sticky fault
+    /// (an illegal address, a trap) outlives the error paths, which read and clear the error they report.
+    int chain_cuda_error() const;
+
 private:
+    bool ple_on_() const;        ///< this stage holds layer 1, where the PLE block runs
+    bool ple_batched_() const;   ///< ... and runs it batched over the chunk (run_impl's choice)
+    std::atomic<int> cuda_err_{0};   ///< chain_cuda_error: this stage's (set by the stage before it)
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool

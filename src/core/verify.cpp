@@ -731,8 +731,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
+    bool prio = false;   // set_stream_priority_high (STRATA_PIPE_OVERLAP): the device's greatest priority, else normal
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)   // (HIP: the default priority)
+    if (prio_high_ && ext_stream_ == nullptr) {
+        int prio_lo = 0, prio_hi = 0;
+        if (cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
+            prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
+        if (!prio) cs_ = nullptr;
+        cudaGetLastError();
+        std::fprintf(stderr, "strata verify: CUDA%d's window stream %s\n", device_,
+                     prio ? ("at priority " + std::to_string(prio_hi) + " (the greatest)").c_str()
+                          : "at the default priority (no greater one could be made)");
+    }
+#endif
     if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
-    else if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
+    else if (!prio && cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) cs_ = nullptr;
     if (cs_ == nullptr || cudaStreamCreateWithFlags(&sh_cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
@@ -2777,6 +2790,10 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
     const auto key = bkey(rows, S, hbase);
+    if (no_capture_ && !layout_captured(key)) {
+        err = "verify: a batch layout was not captured before an overlapped read";
+        return false;
+    }
     bool evicted = false;
     if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
         !evict_batch_graph(key, evicted, err))
@@ -3002,6 +3019,60 @@ bool Verifier::sample_rows(int S, std::string& err) {
         any = true;
     }
     if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+    return true;
+}
+
+bool Verifier::has_batch_layout(int base, int S) const {
+    if (S < 1 || S > 8) return false;
+    int rows[8] = {};
+    for (int t = 0; t < S; ++t) rows[t] = base + t;
+    return layout_captured(bkey(rows, S, base));
+}
+
+bool Verifier::layout_captured(const std::vector<int>& key) const {
+    const auto e = exec_bm_.find(key);   // (find: a failed capture leaves a null entry)
+    const auto c = commit_bm_.find(key);
+    return e != exec_bm_.end() && e->second != nullptr && c != commit_bm_.end() && c->second != nullptr;
+}
+
+// The captures stage_batch makes on a layout's first window, made ahead (the graphs are the same: record_window reads
+// only what is fixed while nothing runs - the slots' sessions, the table's verdict, the PLE setup).  The commit graph
+// is uploaded too, so its first launch does not.
+bool Verifier::ensure_batch_layouts(int GS, int groups, int& captured, std::string& err) {
+    const OnDevice on_device(device_);
+    captured = 0;
+    if (g_ == nullptr || slots_.empty()) { err = "verify: batch layouts before init_slots"; return false; }
+    if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    if (GS < 1 || GS > max_t_ || groups < 1 || groups * GS > (int) slots_.size()) {
+        err = "verify: batch layouts out of range";
+        return false;
+    }
+    refresh_ar();
+    for (int gi = 0; gi < groups; ++gi) {
+        const int base = gi * GS;
+        if (has_batch_layout(base, GS)) continue;
+        int rows[8] = {};
+        for (int t = 0; t < GS; ++t) rows[t] = base + t;
+        const auto key = bkey(rows, GS, base);
+        bool evicted = false;
+        if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
+            !evict_batch_graph(key, evicted, err))
+            return false;
+        bm_used_[key] = ++bm_tick_;
+        if (!capture_batch(rows, GS, base, err) || !capture_commit_batch(rows, GS, base, err)) return false;
+        cudaGraphUpload(commit_bm_[key], cs_);
+        ++captured;
+    }
+    if (captured > 0 && cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("verify: batch layouts: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    for (int gi = 0; gi < groups; ++gi)   // a later capture may have evicted an earlier one (no VRAM)
+        if (!has_batch_layout(gi * GS, GS)) {
+            err = "verify: the batch layout over slots " + std::to_string(gi * GS) + ".." + std::to_string(gi * GS + GS - 1) +
+                  " could not be kept";
+            return false;
+        }
     return true;
 }
 

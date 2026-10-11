@@ -205,6 +205,23 @@ public:
     /// STRATA_PIPE_OVERLAP: a pipeline stage's batch window asks for its PLE rows as urgent (PleTable::gather_batch),
     /// ahead of a prompt chunk's rows read at the same time. Off by default; the rows are the same either way.
     void set_ple_urgent(bool on) { ple_urgent_ = on; }
+    /// STRATA_PIPE_OVERLAP (STRATA_PIPE_OVERLAP_PRIO, default on): the window stream is made at the device's greatest
+    /// priority, so the batch windows' blocks go ahead of a prompt read's on the same card (a normal stream when that
+    /// fails).  Before `init`; only the order work starts in, never a result.
+    void set_stream_priority_high(bool on) { prio_high_ = on; }
+    /// Is the zero-doorbell graph the one a batch window would run now (every expert of the stage in VRAM by the host
+    /// table)?  Looks at the table, as each window does.
+    bool ar_live() { refresh_ar(); return ar_on(); }
+    /// Are the window and commit graphs of the pipeline group layout (slots base .. base + S - 1, its hand-off rows
+    /// from `base`) captured for the graph variant the last look at the table chose?
+    bool has_batch_layout(int base, int S) const;
+    /// STRATA_PIPE_OVERLAP, with nothing in flight: capture the full layout (S = GS) of each of `groups` pipeline
+    /// groups that is missing, as a window would on first use (`captured`: how many).  False with `err` when one could
+    /// not be captured or is missing after.
+    bool ensure_batch_layouts(int GS, int groups, int& captured, std::string& err);
+    /// STRATA_PIPE_OVERLAP: while set, a batch window whose layout was never captured fails with an error instead of
+    /// capturing it (no capture may run beside a prompt read).
+    void set_no_capture(bool on) { no_capture_ = on; }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -327,6 +344,9 @@ private:
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     bool ple_urgent_ = false;              ///< set_ple_urgent: stage_batch's PLE gather is urgent
+    bool prio_high_ = false;               ///< set_stream_priority_high
+    bool no_capture_ = false;              ///< set_no_capture
+    bool layout_captured(const std::vector<int>& key) const;   ///< both graphs of a batch key, instantiated
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);

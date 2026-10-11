@@ -2070,6 +2070,52 @@ struct PeTimer {
 };
 }  // namespace
 
+bool Prefill::ple_on_() const {
+    return impl_->ss != nullptr && impl_->ss->ple.ready() && stage_lb_ <= 1 && 1 < stage_le_;
+}
+
+// the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
+// STRATA_PLE_BATCH=0 keeps the per-token block (the A/B).  Read live: a relayout changes region_bytes.
+bool Prefill::ple_batched_() const {
+    static const bool ple_batch_env = [] {
+        const char* v = std::getenv("STRATA_PLE_BATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const Impl& m = *impl_;
+    return ple_on_() && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
+           (m.ss->ple.w.key_bf16 != nullptr || m.ss->ple.w.key_native_data != nullptr) &&
+           m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+}
+
+int Prefill::device() const { return impl_->device; }
+
+bool Prefill::overlap_safe(std::string& why) const {
+    for (const Prefill* p = this; p != nullptr; p = p->next_) {
+        const Impl& m = *p->impl_;
+        const std::string dev = "CUDA" + std::to_string(m.device) + "'s prompt path";
+        if (m.g == nullptr || m.ss == nullptr) { why = dev + " is not set up"; return false; }
+        if (m.pp) { why = dev + " has a --peer-device peer"; return false; }
+        if (m.help_pp || p->helper_ != nullptr) { why = dev + " has a stage helper (STRATA_PREFILL_HELP)"; return false; }
+        if (p->cpu_pool_ != nullptr) { why = dev + " has the CPU expert pool"; return false; }
+        if (m.borrowed) { why = dev + " reads in lent expert cache slots"; return false; }
+        if (m.ss->qsa_states != nullptr && m.ss->qsa_states[m.ss->qsa_primary()].kv_mode == 1) {
+            why = dev + " streams the K/V (--kv-resident)";
+            return false;
+        }
+        if (p->ple_on_() && !p->ple_batched_()) {
+            why = dev + " runs the PLE block token by token (STRATA_PLE_BATCH=0, or no native postops or key)";
+            return false;
+        }
+    }
+    return true;
+}
+
+int Prefill::chain_cuda_error() const {
+    for (const Prefill* p = this; p != nullptr; p = p->next_)
+        if (const int e = p->cuda_err_.load()) return e;
+    return 0;
+}
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     Impl& m = *impl_;
@@ -2135,16 +2181,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
-    const bool ple_on = ss.ple.ready() && LB <= 1 && 1 < LE;
-    // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
-    // STRATA_PLE_BATCH=0 keeps the per-token block (the A/B)
-    static const bool ple_batch_env = [] {
-        const char* v = std::getenv("STRATA_PLE_BATCH");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
-    const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
-                           (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
-                           m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+    const bool ple_on = ple_on_();
+    const bool ple_batch = ple_batched_();
     const int32_t prev0[2] = {prev[0], prev[1]};
     auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = std::min(m.T, n - c0);
@@ -4105,7 +4143,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             next_->single_chunk_ = single_chunk;
             next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
                 strata::aux_cpus::pin_current_thread();
-                return next_->run_impl(tokens + c0, T, p0, next_err_);
+                const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
+                int none = 0;   // the thread's error state ends with it: keep the first fault for chain_cuda_error
+                if (const int e = (int) cudaPeekAtLastError(); e != 0) next_->cuda_err_.compare_exchange_strong(none, e);
+                return r;
             });
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
@@ -4269,6 +4310,7 @@ bool Prefill::drain_pipeline(std::string& err) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    for (Prefill* p = this; p != nullptr; p = p->next_) p->cuda_err_.store(0);
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;

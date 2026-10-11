@@ -90,6 +90,13 @@ public:
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
+    /// STRATA_PIPE_OVERLAP, before a prompt read that runs beside batch windows: size the prefill's input records for
+    /// `n` rows (a prompt chunk) and capture its graphs for 1..max_t rows now, so prefill() of up to `n` rows neither
+    /// frees, allocates nor captures (each of them waits for the device).  Free when done already.
+    bool reserve_prefill_records(int64_t n, std::string& err);
+    /// STRATA_PIPE_OVERLAP_MTP_PRIO (an A/B knob): 1 = the drafter's stream at the device's greatest priority, 0 = at
+    /// the default one; -1 (default) = as set_force_capture decides.  Before `load`.
+    void set_stream_priority(int p) { stream_prio_ = p; }
     cudaStream_t stream() const { return cs_; }
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
@@ -215,6 +222,7 @@ private:
     // --pipeline-windows 2 (chain_launch)
     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
     bool force_on_ = false, chain_live_ = false;
+    int stream_prio_ = -1;   ///< set_stream_priority
     const float* src_R_ = nullptr;
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
     cudaEvent_t ev_chain_ = nullptr;
