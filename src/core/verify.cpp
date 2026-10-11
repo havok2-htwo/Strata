@@ -2822,7 +2822,12 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             }
             ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
         }
+        const Clock::time_point tg = ple_urgent_ ? Clock::now() : Clock::time_point{};
         if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err, ple_urgent_)) return false;
+        if (ple_urgent_) {   // STRATA_PIPE_OVERLAP's stats line: how long a window's rows took beside a prompt's
+            ms_ple_urgent += ms_since(tg);
+            ++n_ple_urgent;
+        }
     }
     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
     // decoding may change the prefix length after comparing the draft with these picks.

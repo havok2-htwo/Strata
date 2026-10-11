@@ -205,6 +205,10 @@ public:
     /// stage's chunks run on threads of their own, which take their error state with them; only a sticky fault
     /// (an illegal address, a trap) outlives the error paths, which read and clear the error they report.
     int chain_cuda_error() const;
+    /// After `run` threw (a thread that could not start, an allocation): wait for every later stage's chunk still
+    /// running, whatever it returns or throws, so nothing of this read runs on after it.  `run` itself joins them
+    /// only when it returns.  STRATA_PIPE_OVERLAP's read thread calls it; nothing else does.
+    void join_chain() noexcept;
 
 private:
     bool ple_on_() const;        ///< this stage holds layer 1, where the PLE block runs

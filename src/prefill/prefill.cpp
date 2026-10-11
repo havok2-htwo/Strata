@@ -4309,6 +4309,16 @@ bool Prefill::drain_pipeline(std::string& err) {
     return ok;
 }
 
+void Prefill::join_chain() noexcept {
+    for (Prefill* p = this; p != nullptr; p = p->next_)   // stage k's future is stage k+1's chunk (it may start k+2's)
+        if (p->next_run_.valid()) {
+            try {
+                (void) p->next_run_.get();
+            } catch (...) {
+            }
+        }
+}
+
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     for (Prefill* p = this; p != nullptr; p = p->next_) p->cuda_err_.store(0);
     const bool body_ok = run_impl(tokens, n, pos0, err);
