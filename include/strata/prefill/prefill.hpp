@@ -123,6 +123,11 @@ public:
     /// keeps the ring full.  STRATA_RING_BYTES=0: 0.1.39's ring, loan and chunk list.
     static bool ring_bytes_enabled();
 
+    /// STRATA_MMQ_DIRECT: the guard each sized expert-cache slot keeps after its blob (ExpertCache::set_slot_guard),
+    /// so the prompt MMQ can read a resident expert in its slot.  0 unless STRATA_MMQ_DIRECT is 1 or 2 on a CUDA
+    /// build with the pointer-table MMQ (STRATA_MMQ_TAB).
+    static size_t slot_guard_bytes();
+
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);

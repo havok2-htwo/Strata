@@ -1931,6 +1931,7 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
 }
 
 bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
+size_t Prefill::slot_guard_bytes() { return mmq::direct_slot_guard(); }
 
 namespace {
 

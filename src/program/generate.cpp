@@ -2712,6 +2712,9 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
+    // STRATA_MMQ_DIRECT: the room each sized expert slot keeps after its blob (0 unless it is on: the slot costs and
+    // the arena are then today's, byte for byte)
+    const int64_t slot_guard = native_pack ? (int64_t) strata::prefill::Prefill::slot_guard_bytes() : 0;
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
     // pinned/mapped host budget (dxg gpadl, ~1 GiB) is spent by CUDA0's weights and MTP before the later loop runs,
     // and a new context then fails with cudaErrorMemoryAllocation (CUDA2: "cudaSetDevice(2) failed: out of memory").
@@ -3313,7 +3316,8 @@ int main(int argc, char** argv) {
             const auto& lay = strata::kernels::cpu::expert_layout();
             int64_t pairs_bytes = 0;
             for (const auto& pr : prof)
-                pairs_bytes += native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+                pairs_bytes += native_pack ? strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard)
+                                           : (int64_t) lay.max_blob;
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
             const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
@@ -3724,7 +3728,8 @@ int main(int argc, char** argv) {
             total_mass += (mass[r] = hi - lo);
         }
         auto cost = [&](int64_t l) -> int64_t {
-            return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+            return native_pack ? strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(l), slot_guard)
+                               : (int64_t) lay.max_blob;
         };
         // the predicted window time (ms) of a placement, and the routed mass its caches hold
         std::vector<int64_t> held_cnt((size_t) ns, 0);   // per-stage fill count, for the startability gate
@@ -4964,7 +4969,7 @@ int main(int argc, char** argv) {
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         uint64_t sum = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
-            sum += (lay.blob_bytes(l) + 255) / 256 * 256;
+            sum += (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(l), slot_guard);
         int64_t q = sum > 0 ? (int64_t) (cap / sum) : 0;
         if (q > g.n_expert) q = g.n_expert;
         if (q > 0) {
@@ -4990,7 +4995,7 @@ int main(int argc, char** argv) {
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
-            const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
+            const uint64_t b = (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard);
             if (used + b > cap) break;
             used += b;
             sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
@@ -5022,6 +5027,10 @@ int main(int argc, char** argv) {
             xcache.set_segment_bytes(o.vram_segment_mib << 20);
         }
     }
+    // STRATA_MMQ_DIRECT: the guard after each sized slot (kept across the retry loop's close/open)
+    xcache.set_slot_guard(slot_guard);
+    if (slot_guard > 0)
+        std::fprintf(stderr, "strata generate: +%lld B guard per sized slot (STRATA_MMQ_DIRECT)\n", (long long) slot_guard);
     if (o.expert_cache > 0) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
@@ -5043,8 +5052,9 @@ int main(int argc, char** argv) {
             if (!sized_slots.empty()) {
                 int64_t used = 0;
                 size_t keep = 0;
-                while (keep < sized_slots.size() && used + (sized_slots[keep] + 255) / 256 * 256 <= keep_bytes)
-                    used += (sized_slots[keep++] + 255) / 256 * 256;
+                while (keep < sized_slots.size() &&
+                       used + strata::core::ExpertCache::slot_stride(sized_slots[keep], slot_guard) <= keep_bytes)
+                    used += strata::core::ExpertCache::slot_stride(sized_slots[keep++], slot_guard);
                 sized_slots.resize(keep);
                 o.expert_cache = (int) keep;
             } else {
@@ -5056,7 +5066,7 @@ int main(int argc, char** argv) {
         auto cache_bytes = [&]() -> int64_t {
             if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             int64_t b = 0;
-            for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
+            for (const int64_t s : sized_slots) b += strata::core::ExpertCache::slot_stride(s, slot_guard);
             return b;
         };
         // With `--expert-cache auto` the reserve must still be free once the slots are WRITTEN: under WDDM an
@@ -5266,7 +5276,8 @@ int main(int argc, char** argv) {
         std::vector<int64_t> sized;
         int64_t used = 0;
         for (const auto& pr : st.profile) {
-            const int64_t b = native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+            const int64_t b = native_pack ? strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard)
+                                          : (int64_t) lay.max_blob;
             if (used + b > room) break;
             used += b;
             sized.push_back((int64_t) lay.blob_bytes(pr.first));
@@ -5275,6 +5286,7 @@ int main(int argc, char** argv) {
         // Windows commit, or the free figure ran high): it is tried again with 90% of the slots, up to 3 times, each
         // try said.  Nothing changes when the first open works.
         bool stage_open = false;
+        st.cache.set_slot_guard(slot_guard);   // STRATA_MMQ_DIRECT: the stages' prompt MMQ reads their own slots
         for (int attempt = 0; !sized.empty(); ++attempt) {
             stage_open = native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
                                      : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err);
