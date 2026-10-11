@@ -112,6 +112,8 @@ public:
         return t >= 0 && t < 32 && ((nf_mask_ >> t) & 1u) != 0;
     }
     static bool nan_guard_on();
+    /// The most tokens one window holds (`init`'s `max_t`; 0 before it).
+    int max_t() const { return max_t_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
