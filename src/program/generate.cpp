@@ -11302,7 +11302,7 @@ int main(int argc, char** argv) {
                         if (!fired.exchange(true)) {
                             wok = false;
                             we = "test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=cuda): the read reported a CUDA fault";
-                            wcuda = (int) cudaErrorIllegalAddress;
+                            wcuda = -1;   // (any nonzero: a fault; no CUDA enum, generate.cpp builds for HIP too)
                         }
                     }
                     if (pipe_overlap_debug().fault == OvFault::stall) {   // STRATA_PIPE_OVERLAP_TEST_FAULT=stall
