@@ -168,6 +168,16 @@ bool pipe_overlap_env() {
     }();
     return on;
 }
+// STRATA_PIPE_BYIELD_NODRAIN=1 (read once; off by default): with the pipelined groups, a BYIELD that reaches the main
+// loop is dropped without draining the groups first.  A pipelined read never gives way (batch_read_piece), so the
+// BYIELD is for a read that has ended, and the drain (and the refill after it) did nothing for it
+bool pipe_byield_nodrain_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PIPE_BYIELD_NODRAIN");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
 // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
 // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
 // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
@@ -10019,9 +10029,10 @@ int main(int argc, char** argv) {
                     }
                     ov_dec_valid = false;
                 }
-                // a request reads its prompt through every stage: the groups in flight finish first (STRATA_PIPE_OVERLAP:
-                // not for a BYIELD, which is dropped below)
-                if (piped && line.rfind("BSTOP ", 0) != 0 && !(pipe_overlap_env() && line.rfind("BYIELD", 0) == 0)) {
+                // a request reads its prompt through every stage: the groups in flight finish first (STRATA_PIPE_OVERLAP,
+                // STRATA_PIPE_BYIELD_NODRAIN: not for a BYIELD, which is dropped below)
+                if (piped && line.rfind("BSTOP ", 0) != 0 &&
+                    !((pipe_overlap_env() || pipe_byield_nodrain_env()) && line.rfind("BYIELD", 0) == 0)) {
                     const int in_flight = trace ? (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) {
                                                       return G.inflight; }) : 0;
                     const auto td = Clock::now();
