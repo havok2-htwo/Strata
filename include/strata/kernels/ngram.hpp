@@ -185,7 +185,28 @@ public:
     /// Plan v0.3 P5: the rows of `n_tokens` tokens (16 each, `rows` token-major) into `out` (2560 floats per token),
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
-    bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// `urgent` (Direct mode): the request goes ahead of the reads already queued (PleReader::issue), for a decode
+    /// window's rows while a prompt's chunk is being read; the rows are the same either way.
+    bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err, bool urgent = false);
+
+    /// Two threads may call `gather_batch` at once (a prompt read beside decode windows, STRATA_PIPE_OVERLAP):
+    /// the table's own bookkeeping (the pending token, the prefetch slots) is then taken under a lock, and the
+    /// rows themselves are read outside it - the mapping is read-only, and the threaded reader locks itself.
+    /// Off (the default) takes no lock, as before. Set it before any thread reads the table; `close` keeps it.
+    /// Only `concurrent_capable` tables are read from two threads; a Direct table without the I/O worker would
+    /// keep its reads under the lock.
+    void set_concurrent(bool on);
+    /// Mmap mode, or Direct mode with the reader's I/O worker (not --ple-sync-submit), or not open.
+    bool concurrent_capable() const;
+    /// Direct mode with the I/O worker: read slots kept for urgent requests (PleReader::set_urgent_reserve). A no-op
+    /// in the other modes. Call after `open`.
+    void set_urgent_reserve(uint32_t n);
+    /// The reader's counts (Direct mode; zeros in Mmap mode), for a stats line.
+    struct IoCounts {
+        uint64_t requests = 0, cache_hits = 0, urgent_tickets = 0;
+        double urgent_wait_us = 0;
+    };
+    IoCounts io_counts() const;
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

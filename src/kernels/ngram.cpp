@@ -18,6 +18,7 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <stdexcept>
@@ -204,7 +205,7 @@ struct PleTable::Impl {
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
     const PleFormatInfo* fmt = &ple_format_info(PleFormat::IQ4_NL);   // the table's format (#296: Q5_0 is one of them)
-    mutable uint64_t bytes_read = 0;
+    mutable std::atomic<uint64_t> bytes_read{0};   // atomic: with `concurrent` two threads count rows
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
     PleIo mode = PleIo::Mmap;
@@ -221,7 +222,20 @@ struct PleTable::Impl {
     uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     float scale = 1.0f;               // the FP8 table's one scale
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
+    // `set_concurrent`: the state above that changes after `open` (`pending`, `rows`, `raw`, `ticket`, the prefetch
+    // slots) is taken under `mu`. Off, `hold` returns an empty lock and every entry runs as it did without it.
+    bool concurrent = false;
+    std::mutex mu;
+    std::unique_lock<std::mutex> hold(bool need = true) {
+        std::unique_lock<std::mutex> lk(mu, std::defer_lock);
+        if (concurrent && need) lk.lock();
+        return lk;
+    }
+    // A row read that may run outside `mu`: the mapping is read-only and the threaded reader locks itself.
+    bool reads_unlocked() const { return mode == PleIo::Mmap || reader.threaded(); }
     void decode(const uint8_t* row, float* out160) const { fmt->dequant(row, scale, out160); }
+    void wait_prefetches();                              // the bodies of the public entries, under `hold`
+    uint32_t read_row(uint32_t row, float* out160);     // the bytes it read; the caller counts them
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -388,18 +402,24 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     return true;
 }
 
-void PleTable::wait_prefetches() {
-    if (impl_->n_prefetch == 0) return;
+void PleTable::Impl::wait_prefetches() {
+    if (n_prefetch == 0) return;
     std::string dummy;
-    for (size_t i = 0; i < impl_->n_prefetch; ++i) (void) impl_->reader.collect(impl_->prefetch_tickets[i], dummy);
-    impl_->n_prefetch = 0;
+    for (size_t i = 0; i < n_prefetch; ++i) (void) reader.collect(prefetch_tickets[i], dummy);
+    n_prefetch = 0;
+}
+
+void PleTable::wait_prefetches() {
+    const auto lk = impl_->hold();
+    impl_->wait_prefetches();
 }
 
 void PleTable::prefetch_rows(const uint32_t* rows16) {
+    const auto lk = impl_->hold();
     if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
         for (size_t i = 0; i < impl_->n_prefetch; ++i)
             if (std::memcmp(impl_->prefetch_keys[i], rows16, sizeof(uint32_t) * PLE_N_HEADS) == 0) return;
-        if (impl_->n_prefetch >= Impl::kMaxPrefetch) wait_prefetches();
+        if (impl_->n_prefetch >= Impl::kMaxPrefetch) impl_->wait_prefetches();
         const size_t slot = impl_->n_prefetch++;
         std::memcpy(impl_->prefetch_keys[slot], rows16, sizeof(uint32_t) * PLE_N_HEADS);
         impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
@@ -421,7 +441,8 @@ void PleTable::prefetch_rows(const uint32_t* rows16) {
 }
 
 void PleTable::close() {
-    wait_prefetches();
+    const auto lk = impl_->hold();
+    impl_->wait_prefetches();
     impl_->reader.close();
     impl_->pending = false;
     impl_->locked = false;   // the unmap below releases the lock
@@ -433,7 +454,7 @@ void PleTable::close() {
     impl_->rb = PLE_ROW_BYTES;
     impl_->fmt = &ple_format_info(PleFormat::IQ4_NL);
     impl_->scale = 1.0f;
-    impl_->bytes_read = 0;
+    impl_->bytes_read.store(0);
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
@@ -441,31 +462,53 @@ bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const { return impl_->fmt->name; }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
-uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
+uint64_t PleTable::bytes_read() const { return impl_->bytes_read.load(); }
 
-void PleTable::read_row(uint32_t row, float* out160) const {
-    if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
+void PleTable::set_concurrent(bool on) { impl_->concurrent = on; }
+bool PleTable::concurrent_capable() const { return !is_open() || impl_->reads_unlocked(); }
+void PleTable::set_urgent_reserve(uint32_t n) {
+    if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) impl_->reader.set_urgent_reserve(n);
+}
+PleTable::IoCounts PleTable::io_counts() const {
+    IoCounts c;
+    if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return c;
+    const strata::ngram::ReaderStats s = impl_->reader.snapshot();
+    c.requests = s.requests;
+    c.cache_hits = s.cache_hits;
+    c.urgent_tickets = s.urgent_tickets;
+    c.urgent_wait_us = s.urgent_wait_us;
+    return c;
+}
+
+uint32_t PleTable::Impl::read_row(uint32_t row, float* out160) {
+    if (mode == PleIo::Direct && reader.is_open()) {
         uint8_t raw[PLE_ROW_BYTES_MAX];
         std::string err;
-        const auto t = impl_->reader.issue(&row, 1, raw);
-        if (!impl_->reader.collect(t, err)) {
+        const auto t = reader.issue(&row, 1, raw);
+        if (!reader.collect(t, err)) {
             std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
-            return;
+            return 0;
         }
-        impl_->decode(raw, out160);
-        impl_->bytes_read += impl_->rb;
-        return;
+        decode(raw, out160);
+        return rb;
     }
-    if (impl_->data == nullptr || row >= impl_->n_rows) {
+    if (data == nullptr || row >= n_rows) {
         std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
-        return;
+        return 0;
     }
-    impl_->decode(impl_->data + (size_t) row * impl_->rb, out160);
-    impl_->bytes_read += impl_->rb;
+    decode(data + (size_t) row * rb, out160);
+    return rb;
+}
+
+void PleTable::read_row(uint32_t row, float* out160) const {
+    const auto lk = impl_->hold(!impl_->reads_unlocked());
+    const uint32_t got = impl_->read_row(row, out160);
+    if (got > 0) impl_->bytes_read.fetch_add(got, std::memory_order_relaxed);
 }
 
 bool PleTable::issue(const uint32_t* rows16) {
-    wait_prefetches();
+    const auto lk = impl_->hold();
+    impl_->wait_prefetches();
     std::memcpy(impl_->rows, rows16, sizeof impl_->rows);
     if (impl_->mode == PleIo::Direct) {
         if (impl_->pending) return false;              // one token in flight per table
@@ -491,20 +534,24 @@ bool PleTable::issue(const uint32_t* rows16) {
 }
 
 bool PleTable::collect(float* out2560, std::string& err) {
+    const auto lk = impl_->hold();
     if (!impl_->pending) { err = "PleTable::collect without issue"; return false; }
     impl_->pending = false;
     if (impl_->mode == PleIo::Direct) {
         if (!impl_->reader.collect(impl_->ticket, err)) return false;
         for (int h = 0; h < PLE_N_HEADS; ++h)
             impl_->decode(impl_->raw + (size_t) h * impl_->rb, out2560 + (size_t) h * PLE_HEAD_DIM);
-        impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->rb;
+        impl_->bytes_read.fetch_add((uint64_t) PLE_N_HEADS * impl_->rb, std::memory_order_relaxed);
         return true;
     }
-    for (int h = 0; h < PLE_N_HEADS; ++h) read_row(impl_->rows[h], out2560 + (size_t) h * PLE_HEAD_DIM);
+    uint64_t got = 0;
+    for (int h = 0; h < PLE_N_HEADS; ++h) got += impl_->read_row(impl_->rows[h], out2560 + (size_t) h * PLE_HEAD_DIM);
+    impl_->bytes_read.fetch_add(got, std::memory_order_relaxed);
     return true;
 }
 
-bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
+bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err, bool urgent) {
+    auto lk = impl_->hold();
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {
@@ -532,20 +579,26 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
                                       out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
                     }
                 }
-                impl_->bytes_read += (uint64_t) n * impl_->rb;
+                impl_->bytes_read.fetch_add((uint64_t) n * impl_->rb, std::memory_order_relaxed);
                 return true;
             }
         }
-        wait_prefetches();
+        impl_->wait_prefetches();
+        // the rows go into a local buffer: the read itself needs no table state, so with the threaded reader it
+        // runs outside the lock, beside the other thread's gather
+        if (lk.owns_lock() && impl_->reads_unlocked()) lk.unlock();
         std::vector<uint8_t> raw(n * impl_->rb);
-        const auto ticket = impl_->reader.issue(rows, n, raw.data());
+        const auto ticket = impl_->reader.issue(rows, n, raw.data(), urgent);
         if (!impl_->reader.collect(ticket, err)) return false;
         for (size_t i = 0; i < n; ++i) impl_->decode(raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
-        impl_->bytes_read += (uint64_t) n * impl_->rb;
+        impl_->bytes_read.fetch_add((uint64_t) n * impl_->rb, std::memory_order_relaxed);
         return true;
     }
-    wait_prefetches();
-    for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+    impl_->wait_prefetches();
+    if (lk.owns_lock()) lk.unlock();               // the mapping is read-only
+    uint64_t got = 0;                              // counted once per batch, not once per row
+    for (size_t i = 0; i < n; ++i) got += impl_->read_row(rows[i], out + i * PLE_HEAD_DIM);
+    impl_->bytes_read.fetch_add(got, std::memory_order_relaxed);
     return true;
 }
 

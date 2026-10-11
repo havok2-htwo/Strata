@@ -2805,7 +2805,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             }
             ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
         }
-        if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
+        if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err, ple_urgent_)) return false;
     }
     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
     // decoding may change the prefix length after comparing the draft with these picks.

@@ -34,8 +34,9 @@ public:
     static constexpr uint32_t alignment() { return 4096; }
 
     /// Queue one read. Returns false (and sets `err`) if the request could not be queued; a queued request
-    /// always produces exactly one completion.
-    bool submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err);
+    /// always produces exactly one completion. `front`: ahead of the reads not yet issued (PleReader's urgent
+    /// rows), instead of behind them.
+    bool submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err, bool front = false);
 
     /// Wait for up to `max` completions; returns how many were written to `out`. `timeout_ms` < 0 waits
     /// forever; 0 polls. A `wake()` shows up as one completion with tag `WAKE_TAG`.

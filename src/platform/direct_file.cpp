@@ -203,7 +203,7 @@ void DirectFile::close() {
 bool DirectFile::is_open() const { return impl_->file != INVALID_HANDLE_VALUE; }
 uint64_t DirectFile::size() const { return impl_->size; }
 
-bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
+bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err, bool front) {
     if (!is_open()) { err = "DirectFile: not open"; return false; }
     if (offset % alignment() || length % alignment() || ((uintptr_t) buffer) % alignment() || length == 0) {
         err = "DirectFile: unaligned request";
@@ -211,7 +211,8 @@ bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t
     }
     {
         std::lock_guard<std::mutex> lk(impl_->mu);
-        impl_->queue.push_back(Pending{offset, buffer, length, tag});
+        if (front) impl_->queue.push_front(Pending{offset, buffer, length, tag});
+        else impl_->queue.push_back(Pending{offset, buffer, length, tag});
     }
     impl_->cv.notify_one();
     return true;
@@ -328,14 +329,15 @@ void DirectFile::close() {
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
 uint64_t DirectFile::size() const { return impl_->size; }
 
-bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err) {
+bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err, bool front) {
     if (offset % alignment() || length % alignment() || ((uintptr_t) buffer) % alignment() || length == 0) {
         err = "DirectFile: unaligned request";
         return false;
     }
     {
         std::lock_guard<std::mutex> lk(impl_->mu);
-        impl_->queue.push_back(Pending{offset, buffer, length, tag});
+        if (front) impl_->queue.push_front(Pending{offset, buffer, length, tag});
+        else impl_->queue.push_back(Pending{offset, buffer, length, tag});
     }
     impl_->cv_work.notify_one();
     return true;

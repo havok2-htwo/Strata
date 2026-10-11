@@ -39,6 +39,8 @@ struct ReaderStats {
     uint64_t late_injected = 0;   ///< reads delayed by fault injection
     uint64_t keepalive_reads = 0; ///< pages read only to keep the SSD awake (not in `reads`, `bytes` or latencies)
     double keepalive_us_max = 0;  ///< the slowest of them
+    uint64_t urgent_tickets = 0;  ///< collected tickets that were issued urgent
+    double urgent_wait_us = 0;    ///< the part of `wait_us` those spent blocked
     std::vector<float> read_us;   ///< last <= 65,536 read latencies, for percentiles
     double percentile(double q) const;
 };
@@ -67,7 +69,10 @@ public:
 
     /// Start fetching `n` rows; row i's raw bytes land at `out_raw + row_bytes * i`. `out_raw` must stay valid
     /// until `collect` returns. Out-of-range rows produce zero bytes (the mmap path's behaviour).
-    Ticket issue(const uint32_t* rows, size_t n, uint8_t* out_raw);
+    /// `urgent`: the ticket's reads go ahead of every non-urgent read not yet submitted (behind earlier urgent
+    /// ones), here and in the file's own queue - a decode window's rows while a prompt chunk's bulk ticket is
+    /// queued. Only the order of the reads changes, never a row's bytes.
+    Ticket issue(const uint32_t* rows, size_t n, uint8_t* out_raw, bool urgent = false);
 
     /// Block until every row of the ticket is in `out_raw`. Returns false on an I/O error (message in `err`).
     bool collect(Ticket t, std::string& err);
@@ -83,6 +88,14 @@ public:
     /// Fault injection for tests and for the plan's P2 exit check: every read completes no earlier than
     /// `delay_us` after it was issued. 0 disables.
     void set_injected_delay_us(double delay_us);
+
+    /// Keep `n` of the `max_inflight` read slots for urgent tickets: a non-urgent read is submitted only while
+    /// more than `n` slots are free. Clamped to `max_inflight / 2`; 0 (the default, and after `close`) is the
+    /// plain FIFO. The I/O worker only (`io_thread`); without it the reserve stays 0. Call after `open`.
+    void set_urgent_reserve(uint32_t n);
+    uint32_t urgent_reserve() const;
+    /// `io_thread`: a worker owns the reads and every entry point locks, so two threads may issue and collect.
+    bool threaded() const;
 
     /// Read with no ticket in flight (the worker updates these while reads are outstanding; with the keep-alive
     /// on it may also be counting a keep-alive read - `snapshot` takes a consistent copy).

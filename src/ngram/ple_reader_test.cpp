@@ -10,6 +10,7 @@
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -112,8 +113,9 @@ uint32_t gguf_type_id(const char* name) {
 }
 
 // `claimed_rows` is the row count the header states; `rows` rows are actually written (equal unless a test lies)
-std::string write_format_table(const std::string& dir, const k::PleFormatInfo& f, uint32_t rows, uint64_t claimed_rows = 0) {
-    const std::string path = dir + "/ple_format_selftest.gguf";
+std::string write_format_table(const std::string& dir, const k::PleFormatInfo& f, uint32_t rows, uint64_t claimed_rows = 0,
+                               const char* name = "ple_format_selftest.gguf") {
+    const std::string path = dir + "/" + name;
     std::ofstream out(path, std::ios::binary);
     if (!out) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return {}; }
     const auto le = [](auto value, int bytes) {
@@ -239,6 +241,210 @@ void all_formats_round_trip(const std::string& dir) {
     }
 }
 
+/// STRATA_PIPE_OVERLAP's PLE side, part 1: one table read by a prompt's chunks (512 tokens, 8192 rows) on one thread
+/// and by decode windows (4 tokens, urgent) on another, with `set_concurrent(true)`, in every mode that may be read
+/// that way. Every row must be what the format's dequantizer makes of the file's bytes, `bytes_read` must add up, and
+/// no request may fail (an "unknown ticket" or a pending-token error would). The single-thread entries that take the
+/// lock in turn (issue/collect through `gather`, `read_row`, the prefetch fast path, `close`) must not deadlock.
+void concurrent_table(const std::string& dir) {
+    const k::PleFormatInfo& f = k::ple_format_info(k::PleFormat::IQ4_NL);
+    const uint32_t N = 200000;
+    const std::string path = write_format_table(dir, f, N, 0, "ple_concurrent_selftest.gguf");
+    if (path.empty()) { CHECK(false, "concurrent: no table was written"); return; }
+    const auto ref_row = [&](uint32_t r, float* out) {
+        uint8_t raw[k::PLE_ROW_BYTES_MAX];
+        expected_row(r, f.row_bytes, raw);
+        f.dequant(raw, 1.0f, out);
+    };
+    const auto rows_ok = [&](const std::vector<uint32_t>& rows, const std::vector<float>& got) {
+        float ref[k::PLE_HEAD_DIM];
+        for (size_t i = 0; i < rows.size(); ++i) {
+            ref_row(rows[i], ref);
+            if (std::memcmp(ref, got.data() + i * k::PLE_HEAD_DIM, sizeof ref) != 0) return false;
+        }
+        return true;
+    };
+    struct Arm { const char* name; k::PleIo mode; bool thr; uint64_t cache; };
+    const Arm arms[] = {{"mmap", k::PleIo::Mmap, false, 0},
+                        {"direct, I/O worker, row cache", k::PleIo::Direct, true, 4096},
+                        {"direct, I/O worker, no cache", k::PleIo::Direct, true, 0}};
+    for (const Arm& a : arms) {
+        k::PleTable t;
+        std::string err;
+        k::PleIoOptions io;
+        io.mode = a.mode;
+        io.io_thread = a.thr;
+        io.max_inflight = 64;
+        io.cache_rows = a.cache;
+        if (!t.open(path, err, io)) { CHECK(false, "concurrent %s: open: %s", a.name, err.c_str()); continue; }
+        CHECK(t.concurrent_capable(), "concurrent %s: not concurrent_capable", a.name);
+        t.set_concurrent(true);
+        t.set_urgent_reserve(16);
+        // the single-thread entries, each taking the lock (a self-deadlock hangs the test here)
+        {
+            uint32_t rows16[16];
+            for (int h = 0; h < 16; ++h) rows16[h] = (uint32_t) (h * 7919 + 3) % N;
+            std::vector<float> got(16 * k::PLE_HEAD_DIM);
+            t.gather(rows16, got.data());
+            CHECK(rows_ok(std::vector<uint32_t>(rows16, rows16 + 16), got), "concurrent %s: gather", a.name);
+            t.prefetch_rows(rows16);
+            CHECK(t.gather_batch(rows16, 1, got.data(), err), "concurrent %s: prefetched gather_batch: %s", a.name, err.c_str());
+            CHECK(rows_ok(std::vector<uint32_t>(rows16, rows16 + 16), got), "concurrent %s: prefetched gather_batch", a.name);
+            t.read_row(rows16[3], got.data());
+            CHECK(rows_ok({rows16[3]}, got), "concurrent %s: read_row", a.name);
+            t.wait_prefetches();
+        }
+        const uint64_t bytes0 = t.bytes_read();
+        std::atomic<bool> bulk_done{false};
+        std::atomic<uint64_t> rows_read{0};
+        std::atomic<int> bad{0}, urgent_batches{0};
+        std::string bulk_err, urgent_err;
+        std::thread bulk([&] {
+            std::mt19937 rng(21);
+            std::vector<uint32_t> rows(512 * 16);
+            std::vector<float> out(rows.size() * k::PLE_HEAD_DIM);
+            for (int c = 0; c < 6; ++c) {
+                for (auto& r : rows) r = rng() % N;
+                std::string e;
+                if (!t.gather_batch(rows.data(), 512, out.data(), e)) { bulk_err = e; ++bad; break; }
+                if (!rows_ok(rows, out)) { bulk_err = "rows differ"; ++bad; break; }
+                rows_read += rows.size();
+            }
+            bulk_done.store(true);
+        });
+        {
+            std::mt19937 rng(22);
+            std::vector<uint32_t> rows(4 * 16);
+            std::vector<float> out(rows.size() * k::PLE_HEAD_DIM);
+            while (!bulk_done.load() || urgent_batches.load() < 20) {
+                for (auto& r : rows) r = rng() % N;
+                std::string e;
+                if (!t.gather_batch(rows.data(), 4, out.data(), e, true)) { urgent_err = e; ++bad; break; }
+                if (!rows_ok(rows, out)) { urgent_err = "rows differ"; ++bad; break; }
+                rows_read += rows.size();
+                ++urgent_batches;
+            }
+        }
+        bulk.join();
+        CHECK(bad.load() == 0, "concurrent %s: bulk \"%s\", urgent \"%s\"", a.name, bulk_err.c_str(), urgent_err.c_str());
+        CHECK(t.bytes_read() - bytes0 == rows_read.load() * f.row_bytes, "concurrent %s: bytes_read %llu, rows %llu x %u",
+              a.name, (unsigned long long) (t.bytes_read() - bytes0), (unsigned long long) rows_read.load(), f.row_bytes);
+        if (a.mode == k::PleIo::Direct)
+            CHECK(t.io_counts().urgent_tickets == (uint64_t) urgent_batches.load(), "concurrent %s: %llu urgent tickets, %d batches",
+                  a.name, (unsigned long long) t.io_counts().urgent_tickets, urgent_batches.load());
+        else
+            CHECK(t.io_counts().urgent_tickets == 0 && t.io_counts().requests == 0, "concurrent %s: Mmap mode counted reader rows", a.name);
+    }
+    {   // a Direct table without the I/O worker is not read from two threads
+        k::PleTable t;
+        std::string err;
+        k::PleIoOptions io;
+        io.mode = k::PleIo::Direct;
+        io.io_thread = false;
+        io.cache_rows = 0;
+        CHECK(t.open(path, err, io), "concurrent sync: open: %s", err.c_str());
+        CHECK(!t.concurrent_capable(), "concurrent sync: a caller-thread reader claims concurrent_capable");
+        t.set_concurrent(true);                     // still correct from one thread (everything under the lock)
+        std::vector<uint32_t> rows(64 * 16);
+        for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t) (i * 104729u) % N;
+        std::vector<float> out(rows.size() * k::PLE_HEAD_DIM);
+        CHECK(t.gather_batch(rows.data(), 64, out.data(), err, true) && rows_ok(rows, out), "concurrent sync: gather_batch %s", err.c_str());
+    }
+    std::filesystem::remove(path);
+    if (g_fail == 0) std::printf("ple table, a chunk's and a window's gathers on two threads (mmap, direct): OK\n");
+}
+
+/// STRATA_PIPE_OVERLAP's PLE side, part 2: the order of the reads. `inflight` 1 and a 5 ms injected delay make the
+/// order visible: a bulk ticket A, then a 16-row ticket B. Non-urgent with no reserve (today's FIFO), B completes only
+/// after every read of A, so A is done when B is. Urgent, B's reads go before A's queued ones, so A is far from done.
+/// With 64 in flight and a reserve of 16, an urgent ticket issued behind a bulk one of thousands of pages completes
+/// long before the bulk's tail. The rows are right in every arm.
+void urgent_order(const std::string& path, uint32_t N, uint32_t rb) {
+    const double delay = 5000;
+    std::mt19937 rng(31);
+    const auto distinct_pages = [&](size_t n) {    // rows on different pages, so each is its own read
+        std::vector<uint32_t> r;
+        while (r.size() < n) {
+            const uint32_t x = rng() % N;
+            const uint64_t pg = (HEADER + (uint64_t) x * rb) / 4096;
+            bool dup = false;
+            for (uint32_t y : r) dup = dup || (HEADER + (uint64_t) y * rb) / 4096 == pg || (HEADER + (uint64_t) y * rb + rb - 1) / 4096 == pg;
+            if (!dup && (HEADER + (uint64_t) x * rb) / 4096 == (HEADER + (uint64_t) x * rb + rb - 1) / 4096) r.push_back(x);
+        }
+        return r;
+    };
+    const auto check_out = [&](const std::vector<uint32_t>& rows, const std::vector<uint8_t>& out, const char* what) {
+        std::vector<uint8_t> want(rb);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            expected_row(rows[i], rb, want.data());
+            if (std::memcmp(want.data(), &out[i * rb], rb) != 0) { CHECK(false, "%s: row %zu differs", what, i); return; }
+        }
+    };
+    for (bool urgent : {false, true}) {
+        ng::PleReader rd;
+        std::string err;
+        CHECK(rd.open(path, HEADER, N, 1, 0, err, true, rb), "open: %s", err.c_str());
+        rd.set_injected_delay_us(delay);
+        const std::vector<uint32_t> a = distinct_pages(64), b = distinct_pages(16);
+        std::vector<uint8_t> oa(a.size() * rb), ob(b.size() * rb);
+        const auto ta = rd.issue(a.data(), a.size(), oa.data());
+        const auto tb = rd.issue(b.data(), b.size(), ob.data(), urgent);
+        CHECK(rd.collect(tb, err), "order: collect b: %s", err.c_str());
+        const double t0 = now_us();
+        CHECK(rd.collect(ta, err), "order: collect a: %s", err.c_str());
+        const double wait_a = now_us() - t0;
+        if (urgent) CHECK(wait_a >= 20 * delay, "urgent order: A had only %.1f ms left when B was done", wait_a / 1000);
+        else CHECK(wait_a < delay / 2, "FIFO order: A was not done when B was (%.1f ms left)", wait_a / 1000);
+        CHECK(rd.snapshot().urgent_tickets == (urgent ? 1u : 0u), "order: %llu urgent tickets", (unsigned long long) rd.snapshot().urgent_tickets);
+        check_out(a, oa, "order a");
+        check_out(b, ob, "order b");
+    }
+    {   // the reserve: 64 in flight, 16 of them kept for urgent tickets
+        ng::PleReader rd;
+        std::string err;
+        CHECK(rd.open(path, HEADER, N, 64, 0, err, true, rb), "open: %s", err.c_str());
+        rd.set_urgent_reserve(1000);
+        CHECK(rd.urgent_reserve() == 32, "the reserve is not clamped to max_inflight / 2 (%u)", rd.urgent_reserve());
+        rd.set_urgent_reserve(16);
+        CHECK(rd.urgent_reserve() == 16, "reserve %u", rd.urgent_reserve());
+        rd.set_injected_delay_us(3000);
+        std::vector<uint32_t> bulk(8000);
+        for (auto& r : bulk) r = rng() % N;
+        const std::vector<uint32_t> b = distinct_pages(16);
+        std::vector<uint8_t> obulk(bulk.size() * rb), ob(b.size() * rb);
+        const auto tbulk = rd.issue(bulk.data(), bulk.size(), obulk.data());
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));   // the bulk ticket's reads are going out
+        const double t0 = now_us();
+        const auto tb = rd.issue(b.data(), b.size(), ob.data(), true);
+        CHECK(rd.collect(tb, err), "reserve: collect urgent: %s", err.c_str());
+        const double wait_b = now_us() - t0;
+        const double t1 = now_us();
+        CHECK(rd.collect(tbulk, err), "reserve: collect bulk: %s", err.c_str());
+        const double wait_bulk = now_us() - t1;
+        CHECK(wait_b < 10 * 3000, "reserve: the urgent ticket took %.1f ms", wait_b / 1000);
+        CHECK(wait_bulk > 10 * 3000, "reserve: the bulk had only %.1f ms left after the urgent ticket", wait_bulk / 1000);
+        check_out(bulk, obulk, "reserve bulk");
+        check_out(b, ob, "reserve urgent");
+        const ng::ReaderStats st = rd.snapshot();
+        CHECK(st.urgent_tickets == 1 && st.urgent_wait_us > 0 && st.urgent_wait_us <= st.wait_us, "reserve: urgent stats %llu %.0f/%.0f",
+              (unsigned long long) st.urgent_tickets, st.urgent_wait_us, st.wait_us);
+        std::printf("  urgent ticket behind a bulk one (64 in flight, reserve 16, 3 ms reads): %.1f ms, bulk tail %.1f ms\n",
+                    wait_b / 1000, wait_bulk / 1000);
+        rd.close();
+        CHECK(rd.urgent_reserve() == 0, "close kept the reserve");
+    }
+    {   // no reserve without the I/O worker
+        ng::PleReader rd;
+        std::string err;
+        CHECK(rd.open(path, HEADER, N, 64, 0, err, false, rb), "open: %s", err.c_str());
+        rd.set_urgent_reserve(16);
+        CHECK(rd.urgent_reserve() == 0 && !rd.threaded(), "a caller-thread reader took a reserve");
+        std::vector<uint32_t> rows(2000);
+        for (auto& r : rows) r = rng() % N;
+        check_rows(rd, rows, N, rb, "caller thread, after set_urgent_reserve");
+    }
+}
+
 // row_bytes: ng::ROW_BYTES (90, IQ4_NL) is the production default; 110 (#296, OrcaRouter's Q5_0 PLE rows) is
 // run too, through the exact same generic row_bytes path -- nothing here is IQ4_NL-specific, so a second row
 // size run here is the correctness evidence for lifting ngram.cpp's "Q5_0 PLE requires --ple-io mmap" refusal.
@@ -343,6 +549,7 @@ int selftest(const std::string& dir, uint32_t rb) {
         rd.reset_stats();
         CHECK(rd.snapshot().keepalive_reads == 0 && rd.snapshot().keepalive_us_max == 0, "reset_stats kept keep-alive counts");
     }
+    urgent_order(path, N, rb);
     {   // the caller's thread does the reads: no worker, so no keep-alive
         ng::PleReader rd;
         std::string err;
@@ -456,6 +663,8 @@ int main(int argc, char** argv) {
         // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (#296, OrcaRouter's Q5_0 PLE rows) through the
         // same generic row_bytes path -- see the comment on selftest().
         all_formats_round_trip(dir);               // every format of k::ple_formats(), both readers, vs its dequantizer
+        if (g_fail != 0) return 1;
+        concurrent_table(dir);                     // STRATA_PIPE_OVERLAP: two threads gathering from one table
         if (g_fail != 0) return 1;
         const int r90 = selftest(dir, ng::ROW_BYTES);
         const int r110 = selftest(dir, 110);

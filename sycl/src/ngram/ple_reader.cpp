@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -86,10 +87,12 @@ struct Job {
     std::vector<Use> uses;
     double issued_us = 0;
     bool keepalive = false;// no rows and no ticket: it only keeps the SSD awake (`set_keepalive`)
+    bool urgent = false;   // `issue(..., urgent)`: queued ahead of the non-urgent jobs, may use the reserve
 };
 
 struct TicketState {
     uint32_t pending = 0;  // jobs not yet completed
+    bool urgent = false;
     uint32_t jobs = 0;     // SYCL port trace: jobs issued, and when it was issued / first submitted / last completed
     double t_issue = 0, t_first = 0, t_last = 0;
 };
@@ -110,6 +113,7 @@ struct PleReader::Impl {
     uint64_t n_rows = 0;
     uint32_t row_bytes = ROW_BYTES;
     uint32_t max_inflight = 0;
+    uint32_t urgent_reserve = 0;          // slots only an urgent job may take (`set_urgent_reserve`)
     uint8_t* slab = nullptr;              // max_inflight slots of 2 pages
     std::vector<uint32_t> free_slots;
     std::vector<Job> inflight;            // indexed by slot
@@ -155,6 +159,9 @@ struct PleReader::Impl {
 
     bool pump() {
         while (!queue.empty() && !free_slots.empty()) {
+            // The reserve: urgent jobs sit at the front of the queue, so a non-urgent front means none is waiting.
+            // Blocked here, at least `max_inflight - urgent_reserve` reads are in flight, so a completion comes.
+            if (!queue.front().urgent && free_slots.size() <= urgent_reserve) break;
             const uint32_t s = free_slots.back();
             free_slots.pop_back();
             inflight[s] = std::move(queue.front());
@@ -166,7 +173,7 @@ struct PleReader::Impl {
                 if (tt != tickets.end() && tt->second.t_first == 0) tt->second.t_first = j.issued_us;
             }
             std::string kerr;             // a keep-alive read that cannot go out must not fail the reader
-            if (!file.submit(j.offset, slot_buf(s), j.length, s, j.keepalive ? kerr : error)) {
+            if (!file.submit(j.offset, slot_buf(s), j.length, s, j.keepalive ? kerr : error, j.urgent)) {
                 if (j.keepalive) {                 // no more of them: the SSD may sleep as before
                     keep_us = 0;
                     j.keepalive = false;
@@ -423,6 +430,7 @@ void PleReader::close() {
     m.inflight.clear();
     m.free_slots.clear();
     m.cache.init(0);
+    m.urgent_reserve = 0;
     m.threaded = false;
     m.stop = false;
     m.keep_us = 0;
@@ -432,7 +440,7 @@ void PleReader::close() {
 bool PleReader::is_open() const { return impl_->file.is_open(); }
 uint32_t PleReader::row_bytes() const { return impl_->row_bytes; }
 
-PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_raw) {
+PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_raw, bool urgent) {
     Impl& m = *impl_;
     std::unique_lock<std::mutex> lk(m.mu, std::defer_lock);
     if (m.threaded) lk.lock();
@@ -442,6 +450,7 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     const bool rearm = m.keep_us > 0 && (m.last_issue_us <= 0 || now - m.last_issue_us > m.keep_window_us);
     m.last_issue_us = now;
     TicketState& ts = m.tickets[id];
+    ts.urgent = urgent;
     std::unordered_map<uint64_t, size_t> by_page;     // aligned offset -> index in `jobs`
     std::vector<Job> jobs;
     for (size_t i = 0; i < n; ++i) {
@@ -473,6 +482,7 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
         j.offset = first;
         j.length = length;
         j.ticket = id;
+        j.urgent = urgent;
         j.uses.push_back(Use{rows[i], (uint32_t) (at - first), dst});
         jobs.push_back(std::move(j));
     }
@@ -482,7 +492,12 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     ts.jobs = ts.pending;
     ts.t_issue = now_us();
     const bool has_jobs = ts.pending > 0;
-    for (Job& j : jobs) m.queue.push_back(std::move(j));
+    if (urgent) {                                  // behind the urgent jobs already queued, ahead of the rest
+        const auto at = std::find_if(m.queue.begin(), m.queue.end(), [](const Job& j) { return !j.urgent; });
+        m.queue.insert(at, std::make_move_iterator(jobs.begin()), std::make_move_iterator(jobs.end()));
+    } else {
+        for (Job& j : jobs) m.queue.push_back(std::move(j));
+    }
     if (m.threaded) {
         lk.unlock();
         if (has_jobs) {
@@ -511,7 +526,12 @@ bool PleReader::collect(Ticket t, std::string& err) {
         it = m.tickets.find(t.id);
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
         if (!m.error.empty()) { err = m.error; return false; }
-        m.stats.wait_us += now_us() - start;
+        const double waited = now_us() - start;
+        m.stats.wait_us += waited;
+        if (it->second.urgent) {
+            ++m.stats.urgent_tickets;
+            m.stats.urgent_wait_us += waited;
+        }
         if (ple_trace() && it->second.jobs > 0 && it->second.jobs < 200) {
             const TicketState& ts = it->second;
             const double now = now_us();
@@ -531,7 +551,12 @@ bool PleReader::collect(Ticket t, std::string& err) {
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
     }
     if (!m.error.empty()) { err = m.error; return false; }
-    m.stats.wait_us += now_us() - start;
+    const double waited = now_us() - start;
+    m.stats.wait_us += waited;
+    if (it->second.urgent) {
+        ++m.stats.urgent_tickets;
+        m.stats.urgent_wait_us += waited;
+    }
     m.tickets.erase(it);
     return true;
 }
@@ -550,6 +575,20 @@ void PleReader::set_injected_delay_us(double delay_us) {
     std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->delay_us = delay_us < 0 ? 0 : delay_us;
 }
+
+void PleReader::set_urgent_reserve(uint32_t n) {
+    Impl& m = *impl_;
+    {
+        std::lock_guard<std::mutex> lk(m.mu);
+        m.urgent_reserve = m.threaded ? std::min(n, m.max_inflight / 2) : 0;
+    }
+    m.cv_work.notify_all();
+}
+uint32_t PleReader::urgent_reserve() const {
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    return impl_->urgent_reserve;
+}
+bool PleReader::threaded() const { return impl_->threaded; }
 const ReaderStats& PleReader::stats() const { return impl_->stats; }
 ReaderStats PleReader::snapshot() const {
     Impl& m = *impl_;
