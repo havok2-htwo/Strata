@@ -3043,7 +3043,7 @@ bool Verifier::layout_captured(const std::vector<int>& key) const {
 // The captures stage_batch makes on a layout's first window, made ahead (the graphs are the same: record_window reads
 // only what is fixed while nothing runs - the slots' sessions, the table's verdict, the PLE setup).  The commit graph
 // is uploaded too, so its first launch does not.
-bool Verifier::ensure_batch_layouts(int GS, int groups, int& captured, std::string& err) {
+bool Verifier::ensure_batch_layouts(int GS, int groups, int& captured, std::string& err, const std::vector<int>* narrow) {
     const OnDevice on_device(device_);
     captured = 0;
     if (g_ == nullptr || slots_.empty()) { err = "verify: batch layouts before init_slots"; return false; }
@@ -3053,18 +3053,27 @@ bool Verifier::ensure_batch_layouts(int GS, int groups, int& captured, std::stri
         return false;
     }
     refresh_ar();
-    for (int gi = 0; gi < groups; ++gi) {
-        const int base = gi * GS;
-        if (has_batch_layout(base, GS)) continue;
+    // the narrower ones first, each one held marked as used too: an LRU limit evicts none of them here, and the full
+    // widths, which must be kept, last of all
+    std::vector<std::pair<int, int>> want;   // (base, S)
+    if (narrow != nullptr)
+        for (int gi = 0; gi < groups && gi < (int) narrow->size(); ++gi)
+            for (int S = 1; S <= std::min((*narrow)[(size_t) gi], GS - 1); ++S) want.emplace_back(gi * GS, S);
+    for (int gi = 0; gi < groups; ++gi) want.emplace_back(gi * GS, GS);
+    for (const auto& [base, S] : want) {
         int rows[8] = {};
-        for (int t = 0; t < GS; ++t) rows[t] = base + t;
-        const auto key = bkey(rows, GS, base);
+        for (int t = 0; t < S; ++t) rows[t] = base + t;
+        const auto key = bkey(rows, S, base);
+        if (layout_captured(key)) {
+            bm_used_[key] = ++bm_tick_;
+            continue;
+        }
         bool evicted = false;
         if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
             !evict_batch_graph(key, evicted, err))
             return false;
         bm_used_[key] = ++bm_tick_;
-        if (!capture_batch(rows, GS, base, err) || !capture_commit_batch(rows, GS, base, err)) return false;
+        if (!capture_batch(rows, S, base, err) || !capture_commit_batch(rows, S, base, err)) return false;
         cudaGraphUpload(commit_bm_[key], cs_);
         ++captured;
     }

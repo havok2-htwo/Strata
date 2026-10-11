@@ -169,12 +169,13 @@ bool pipe_overlap_env() {
     return on;
 }
 // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
-// started during an overlapped read always runs its full width (its padded-up layout).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1:
-// never padded up, a group whose own layout is missing waits for the read's end; =2: also a group narrower than the
-// full width waits.  STRATA_PIPE_OVERLAP_TEST_FAULT (the fault paths, once per process, during an overlapped read):
-// poll (a window's poll fails), throw (the control-line scan throws), stage (stage 2's chunk fails), stall (the read
-// thread hangs after its read).
-enum class OvFault { none, poll, thrown, stage, stall };
+// started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
+// it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
+// read's end; =2: also a group narrower than the full width waits.  STRATA_PIPE_OVERLAP_TEST_FAULT (the fault paths,
+// once per process, during an overlapped read): poll (a window's poll fails), throw (the control-line scan throws),
+// stage (stage 2's chunk fails), stall (the read thread hangs after its read), cuda (the read reports a CUDA fault
+// after its read: #224's exit, on a sound context).
+enum class OvFault { none, poll, thrown, stage, stall, cuda };
 struct PipeOverlapDebug {
     int force_padup = 0, force_wait = 0;
     OvFault fault = OvFault::none;
@@ -188,7 +189,7 @@ const PipeOverlapDebug& pipe_overlap_debug() {
         if (const char* v = std::getenv("STRATA_PIPE_OVERLAP_TEST_FAULT")) {
             const std::string f = v;
             r.fault = f == "poll" ? OvFault::poll : f == "throw" ? OvFault::thrown : f == "stage" ? OvFault::stage
-                    : f == "stall" ? OvFault::stall : OvFault::none;
+                    : f == "stall" ? OvFault::stall : f == "cuda" ? OvFault::cuda : OvFault::none;
         }
         return r;
     }();
@@ -9749,8 +9750,10 @@ int main(int argc, char** argv) {
             return false;
         };
         // During an overlapped read: the width group gi runs at if it starts now, or 0 (it waits). Its own width (up to
-        // its last active slot) when every stage holds that layout, else the full width when every stage holds that
-        // (overlap_prepare captured it: the extra rows are pad rows, as below its own width), else none - no capture
+        // its last active slot) when every stage holds that layout (overlap_prepare captured every width an active
+        // group may shrink to), else the narrowest wider one every stage holds (the extra rows are pad rows, as below
+        // its own width) whose extra rows park no conversation - a pad row there would cost the slot its cache, which
+        // the run without the overlap keeps (the slot being read into is overwritten anyway) - else none: no capture
         // runs beside the read.  Every stage's table is looked at first, as stage_batch does (the graph's key).
         auto ov_layout = [&](int gi) -> int {
             int S0 = 0;
@@ -9761,9 +9764,18 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < n_pipe; ++k) if (!stage_verifier(k).has_batch_layout(gi * GS, S)) return false;
                 return true;
             };
+            auto parks = [&](int S) {   // a row in [S0, S) would write a parked conversation
+                for (int t = S0; t < S; ++t) {
+                    const int b = gi * GS + t;
+                    if (b != admit_slot && (bs[(size_t) b].cached || bs[(size_t) b].partial)) return true;
+                }
+                return false;
+            };
             const PipeOverlapDebug& dbg = pipe_overlap_debug();
             if (dbg.force_padup == 0 && !(dbg.force_wait >= 2 && S0 < GS) && held(S0)) return S0;
-            if (dbg.force_wait == 0 && held(GS)) return GS;
+            if (dbg.force_wait == 0)   // (from S0 itself only at the full width: FORCE_PADUP's own full width)
+                for (int S = std::min(S0 + 1, GS); S <= GS; ++S)
+                    if (held(S) && !parks(S)) return S;
             return 0;
         };
         // all idle: the timing line, as batch_step (reset_busy: the watchdog's busy flag too - not inside a request)
@@ -11137,15 +11149,19 @@ int main(int argc, char** argv) {
                 return sp.overlap_safe(why);
             };
             // ... and with the gate passed (T_main, nothing in flight): what a read beside the windows may not do itself.
-            // Each stage captures the full-width layout of every group it lacks (a group can then always run, padded up
-            // if its own layout is missing), the drafter sizes its prompt records for a chunk and captures its prompt
-            // graphs, and the stages refuse any capture from here on.  False with `why`: the read is not overlapped.
+            // Each stage captures the full-width layout of every group it lacks and, of each active group, every
+            // narrower one it may shrink to during the read (its own width or less: a group can then always run at its
+            // own width), the drafter sizes its prompt records for a chunk and captures its prompt graphs, and the
+            // stages refuse any capture from here on.  False with `why`: the read is not overlapped.
             auto overlap_prepare = [&](std::string& why) -> bool {
                 const auto t0 = Clock::now();
                 int captured = 0;
+                std::vector<int> ov_narrow(pg.size(), 0);   // each group's own width now (the widest it may shrink to)
+                for (int gi = 0; gi < (int) pg.size(); ++gi)
+                    for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) ov_narrow[(size_t) gi] = t + 1;
                 for (int k = 0; k < n_pipe; ++k) {
                     int c = 0;
-                    if (!stage_verifier(k).ensure_batch_layouts(GS, (int) pg.size(), c, why)) {
+                    if (!stage_verifier(k).ensure_batch_layouts(GS, (int) pg.size(), c, why, &ov_narrow)) {
                         (void) cudaGetLastError();
                         why = "stage " + std::to_string(k + 1) + ": " + why;
                         return false;
@@ -11158,7 +11174,7 @@ int main(int argc, char** argv) {
                 }
                 for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_no_capture(true);
                 if (captured > 0)
-                    std::fprintf(stderr, "strata batch: overlapped read: captured %d full-width group layout%s in %.1f ms\n",
+                    std::fprintf(stderr, "strata batch: overlapped read: captured %d group layout%s in %.1f ms\n",
                                  captured, captured == 1 ? "" : "s",
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 return true;
@@ -11261,6 +11277,14 @@ int main(int argc, char** argv) {
                         sp.join_chain();
                     }
                     wcuda = (int) cudaPeekAtLastError();   // this thread's: a fault the read saw first
+                    if (pipe_overlap_debug().fault == OvFault::cuda) {   // STRATA_PIPE_OVERLAP_TEST_FAULT=cuda
+                        static std::atomic<bool> fired{false};
+                        if (!fired.exchange(true)) {
+                            wok = false;
+                            we = "test fault (STRATA_PIPE_OVERLAP_TEST_FAULT=cuda): the read reported a CUDA fault";
+                            wcuda = (int) cudaErrorIllegalAddress;
+                        }
+                    }
                     if (pipe_overlap_debug().fault == OvFault::stall) {   // STRATA_PIPE_OVERLAP_TEST_FAULT=stall
                         static std::atomic<bool> fired{false};
                         if (!fired.exchange(true)) std::this_thread::sleep_for(std::chrono::seconds(stall_s + join_s + 60));
@@ -11312,7 +11336,11 @@ int main(int argc, char** argv) {
                     if (!we.empty()) std::fprintf(stderr, "strata batch: overlapped read: %s\n", we.c_str());
                     return false;
                 }
-                if (fault) {   // the context is poisoned: no drain, the caller leaves at once (#224)
+                if (fault) {   // the context is poisoned: no drain, the caller leaves at once (#224) - with every stage's
+                    // spin waits released first (a window the last pump started on a sound card waits on its flag)
+                    guard.abort();
+                    std::fprintf(stderr, "strata batch: overlapped read: a CUDA fault (%s); the stages' spin waits "
+                                         "released\n", we.c_str());
                     ov_cuda_fault = true;
                     batch_fatal = true;
                     e = we;

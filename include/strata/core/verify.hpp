@@ -216,9 +216,10 @@ public:
     /// from `base`) captured for the graph variant the last look at the table chose?
     bool has_batch_layout(int base, int S) const;
     /// STRATA_PIPE_OVERLAP, with nothing in flight: capture the full layout (S = GS) of each of `groups` pipeline
-    /// groups that is missing, as a window would on first use (`captured`: how many).  False with `err` when one could
-    /// not be captured or is missing after.
-    bool ensure_batch_layouts(int GS, int groups, int& captured, std::string& err);
+    /// groups that is missing, and of group gi every narrower layout S = 1 .. narrow[gi] (when given; the widths it may
+    /// shrink to), as a window would on first use (`captured`: how many).  False with `err` when one could not be
+    /// captured or is missing after.
+    bool ensure_batch_layouts(int GS, int groups, int& captured, std::string& err, const std::vector<int>* narrow = nullptr);
     /// STRATA_PIPE_OVERLAP: while set, a batch window whose layout was never captured fails with an error instead of
     /// capturing it (no capture may run beside a prompt read).
     void set_no_capture(bool on) { no_capture_ = on; }

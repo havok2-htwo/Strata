@@ -9,7 +9,9 @@ more than one slot group).  Every slot and every admission must equal its solo t
   3. admissions into the last two slots, one after the other, while the background decodes:
        short A; A's next turn into A's slot (slot reuse: copy_from_slot before the read); long B with a BSTOP of a
        background slot and a BYIELD sent during its read; huge C; huge D stopped (STOP) during its read (DONE
-       cancel); short E; long F
+       cancel); short E; long F.  Before B: short G (few tokens) into the last slot, then long H into the one below
+       it - G ends while H is read, and G's next turn (G2) must continue from G's slot (its RESUME past G's prompt:
+       a group start padded up over a parked conversation would have wiped it)
   4. the background is stopped (BSTOP); every request's tokens must equal its solo tokens (a stopped one: a prefix)
 
   python3 tools/batch_overlap_test.py --exe engine/strata-g3-overlap --config <T16 config> \\
@@ -19,7 +21,7 @@ more than one slot group).  Every slot and every admission must equal its solo t
 STRATA_PIPE_OVERLAP_FORCE_PADUP=1, STRATA_PIPE_OVERLAP_FORCE_WAIT=1|2); --compare A.json checks this run's tokens
 against another run's dump (env 0 against 1); --solo-json reuses solo references from an earlier dump (same
 prompts and lengths: the dump records them).  --expect-fault: an arm of STRATA_PIPE_OVERLAP_TEST_FAULT=poll|throw|
-stage|stall (with stall: STRATA_WATCHDOG_S=10 STRATA_PIPE_OVERLAP_JOIN_S=2), passed when the engine answers exactly
+stage|stall|cuda (with stall: STRATA_WATCHDOG_S=10 STRATA_PIPE_OVERLAP_JOIN_S=2), passed when the engine answers exactly
 one ERR and ends by itself (not by the watchdog, no std::terminate).  The engine log (BATCH_TEST_LOG) is checked too, with
 STRATA_TRACE=1 set here: with the env on, an "overlapped read of" line per overlapped read, no "not captured
 before an overlapped read", and no "captured the batch window" between a read's start and its stats line.
@@ -71,6 +73,7 @@ class Driver:
         self.slot_req = {}   # slot -> request name (decoding)
         self.toks = {}       # request name -> tokens
         self.fin = {}        # request name -> finish reason
+        self.resume = {}     # request name -> the prompt tokens it reused (RESUME)
         self.events = []
         threading.Thread(target=self._read, daemon=True).start()
 
@@ -134,6 +137,8 @@ class Driver:
                 self.toks[name].append(int(line.split()[1]))
             elif line.startswith("DONE"):
                 self.fin[name] = line.split()[5]
+            elif line.startswith("RESUME "):
+                self.resume[name] = int(line.split()[1])
             elif line.startswith("ERR"):
                 raise EngineErr(line)
             elif line.startswith("BADM "):
@@ -194,6 +199,7 @@ def main():
     ap.add_argument("--bg", type=int, default=14, help="background slots decoding through the test (<= batch-2)")
     ap.add_argument("--bg-new", type=int, default=600, help="background max_new (they are stopped at the end)")
     ap.add_argument("--max-new", type=int, default=24, help="max_new of the test admissions")
+    ap.add_argument("--g-new", type=int, default=6, help="max_new of G (it must end while H is read)")
     ap.add_argument("--split", default="", help="layer split, e.g. 13,25,37 (default: the config's)")
     ap.add_argument("--extra", default="")
     ap.add_argument("--env", action="append", default=[], help="K=V engine env (repeatable)")
@@ -225,6 +231,8 @@ def main():
     P["D"] = (chat(tok, "Summarize the agenda in one line.", fill=a.huge, seed=53), a.max_new)
     P["E"] = (chat(tok, "What is 17 times 23?", fill=150, seed=54), a.max_new)
     P["F"] = (chat(tok, "Which item came last?", fill=a.long, seed=55), a.max_new)
+    P["G"] = (chat(tok, "Name a color.", fill=150, seed=56), a.g_new)
+    P["H"] = (chat(tok, "How many items were reviewed?", fill=a.long, seed=57), a.max_new)
 
     env = {"STRATA_IQ_MT_MIN": "1", "STRATA_TRACE": "1", **(cfg.get("env") or {})}
     for kv in a.env:
@@ -255,6 +263,11 @@ def main():
     P["A2"] = (a2, a.max_new)
     if "A2" not in solo:
         solo["A2"] = d.solo(a2, a.max_new)
+    g2 = P["G"][0] + solo["G"] + tok.encode("<|im_end|>\n<|im_start|>user\nAnd another?<|im_end|>\n"
+                                            "<|im_start|>assistant\n<think>\n\n</think>\n\n", parse_special=True)
+    P["G2"] = (g2, a.max_new)
+    if "G2" not in solo:
+        solo["G2"] = d.solo(g2, a.max_new)
     print("prompt tokens:", {k: len(v[0]) for k, v in P.items()}, flush=True)
 
     try:
@@ -310,6 +323,15 @@ def batch_phase(a, d, eng, P, solo, s14, s15, env_on):
     d.wait_done("A")
     d.admit(s15, "A2", *P["A2"])   # slot 14 idle: A's slot is not a pad row meanwhile, so its state is reused
     d.wait_done("A2")
+    # G ends while H is read: its slot is parked above its group's own width during that read, and G2 must
+    # continue from it (a pad row there would leave G2 only the main session's copy of G's prompt)
+    d.admit(s15, "G", *P["G"])
+    d.admit(s14, "H", *P["H"])
+    g_in_read = "G" in d.fin
+    d.wait_done("G")
+    d.wait_done("H")
+    d.admit(s15, "G2", *P["G2"])
+    d.wait_done("G2")
     d.admit(s14, "B", *P["B"], during=[(0.05, f"BSTOP {a.bg - 1}"), (0.10, f"BYIELD {s14}")])
     d.admit(s15, "C", *P["C"])
     d.wait_done("B")
@@ -324,8 +346,17 @@ def batch_phase(a, d, eng, P, solo, s14, s15, env_on):
     print(f"admissions done in {time.time() - t0:.1f} s ({active} slots still decoding at the end)", flush=True)
     for e in d.events:
         print("   ", e)
+    g2_resume = d.resume.get("G2", 0)
+    g_slot = len(P["G"][0]) + len(solo["G"]) - 1   # G's prompt and every token a window fed
+    print(f"G2: RESUME {g2_resume} (G's prompt {len(P['G'][0])}, its slot {g_slot}); G ended during H's read: "
+          f"{g_in_read}")
+    ok_resume = g2_resume >= g_slot
+    if not g_in_read:
+        print("note: G did not end while H was read (--g-new smaller?): the parked-slot case was not exercised")
 
-    ok = True
+    ok = ok_resume
+    if not ok_resume:
+        print("G2: DID NOT continue from G's slot")
     for k in P:
         b, s = d.toks.get(k, []), solo[k]
         fin = d.fin.get(k, "?")
@@ -353,9 +384,9 @@ def batch_phase(a, d, eng, P, solo, s14, s15, env_on):
     ok &= check_log(eng.log_path, env_on)
     batch_toks = {k: d.toks.get(k, []) for k in P}
     if a.dump:
-        Path(a.dump).write_text(json.dumps({"prompts": {k: v[0] for k, v in P.items() if k != "A2"},
-                                            "max_new": {k: v[1] for k, v in P.items() if k != "A2"},
-                                            "solo": solo, "batch": batch_toks}))
+        Path(a.dump).write_text(json.dumps({"prompts": {k: v[0] for k, v in P.items() if k not in ("A2", "G2")},
+                                            "max_new": {k: v[1] for k, v in P.items() if k not in ("A2", "G2")},
+                                            "solo": solo, "batch": batch_toks, "resume": d.resume}))
     if a.compare:
         other = json.loads(Path(a.compare).read_text())["batch"]
         diff = [k for k in P if k in other and other[k] != batch_toks[k] and k[:2] != "bg"]
@@ -364,6 +395,11 @@ def batch_phase(a, d, eng, P, solo, s14, s15, env_on):
                  other[k][: min(len(other[k]), len(batch_toks[k]))] != batch_toks[k][: min(len(other[k]), len(batch_toks[k]))]]
         print(f"compare with {a.compare}: " + ("token-identical" if not diff else f"DIFFERS: {diff}"))
         ok &= not diff
+        oth = json.loads(Path(a.compare).read_text()).get("resume", {})
+        rdiff = [k for k in oth if k in d.resume and oth[k] != d.resume[k]]
+        print(f"compare with {a.compare}: RESUME " + ("identical" if not rdiff else
+              "DIFFERS: " + ", ".join(f"{k} {oth[k]} -> {d.resume[k]}" for k in rdiff)))
+        ok &= not rdiff
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 2
 
