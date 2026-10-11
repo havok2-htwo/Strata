@@ -124,8 +124,9 @@ public:
     /// `set_segment_bytes`; `close` keeps it.  0 (the default): no guard.  The uniform `open` ignores it, and so does
     /// the SYCL engine's open_sized (its slots then have no guard, and `slot_tail` finds no room).
     void set_slot_guard(int64_t g) { guard_req_ = g > 0 ? g : 0; }
-    /// The guard the open slots have (0 for uniform slots).
-    int64_t slot_guard() const { return off_.empty() ? 0 : guard_req_; }
+    /// The guard the open slots were laid out with: what `open_sized` applied (0 for uniform slots, when closed, and
+    /// on SYCL, whose open_sized applies none).
+    int64_t slot_guard() const { return guard_; }
     /// A sized slot's arena bytes: the blob plus the guard, 256-byte aligned.
     static int64_t slot_stride(int64_t blob, int64_t guard = 0) { return (blob + guard + 255) / 256 * 256; }
     bool segmented() const { return !segs_.empty(); }
@@ -239,6 +240,7 @@ private:
     int64_t live_slots_ = 0;            ///< #533: slots() - all of them unless shrunk
     int64_t seg_req_ = 0;               ///< #533: the segment size asked for (0: one cudaMalloc)
     int64_t guard_req_ = 0;             ///< STRATA_MMQ_DIRECT: bytes kept after each sized slot's blob (set_slot_guard)
+    int64_t guard_ = 0;                 ///< ...the guard open_sized applied to the open slots (0: none)
     int64_t seg_ = 0;                   ///< #533: the segment size used (a multiple of the driver's granularity)
     uint64_t reserved_ = 0;             ///< #533: the reserved address range's size
     std::vector<unsigned long long> segs_;   ///< #533: each segment's physical handle (0: unmapped)

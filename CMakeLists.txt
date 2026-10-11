@@ -565,6 +565,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(expert_cache_segmented_test PRIVATE strata_engine)
     add_test(NAME expert_cache_segmented_test COMMAND expert_cache_segmented_test)
     set_tests_properties(expert_cache_segmented_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # STRATA_MMQ_DIRECT: slot_guard / slot_room / slot_tail on the uniform and the sized cache, and the default
+    # (no guard) sized layout unchanged
+    add_executable(expert_cache_slot_guard_test tests/core/expert_cache_slot_guard_test.cpp)
+    target_link_libraries(expert_cache_slot_guard_test PRIVATE strata_engine)
+    add_test(NAME expert_cache_slot_guard_test COMMAND expert_cache_slot_guard_test)
+    set_tests_properties(expert_cache_slot_guard_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
   if(STRATA_BUILD_CONVERSATION_TESTS)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)

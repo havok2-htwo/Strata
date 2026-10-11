@@ -5029,8 +5029,13 @@ int main(int argc, char** argv) {
     }
     // STRATA_MMQ_DIRECT: the guard after each sized slot (kept across the retry loop's close/open)
     xcache.set_slot_guard(slot_guard);
-    if (slot_guard > 0)
-        std::fprintf(stderr, "strata generate: +%lld B guard per sized slot (STRATA_MMQ_DIRECT)\n", (long long) slot_guard);
+    if (slot_guard > 0 && o.expert_cache > 0) {
+        if (!sized_slots.empty())
+            std::fprintf(stderr, "strata generate: +%lld B guard per sized slot (STRATA_MMQ_DIRECT)\n", (long long) slot_guard);
+        else   // xcache.open below: every slot is the largest blob's size, and no guard is added
+            std::fprintf(stderr, "strata generate: uniform expert slots, no guard (STRATA_MMQ_DIRECT): an expert is read "
+                                 "in its slot where the slot's slack covers the over-read\n");
+    }
     if (o.expert_cache > 0) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
