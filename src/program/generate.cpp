@@ -1666,14 +1666,13 @@ public:
 private:
     static void spread_current_thread() {
 #if defined(__linux__)
-        if (strata::aux_cpus::enabled()) {
-            strata::aux_cpus::pin_current_thread();
-            return;
-        }
+        // wide first: the mask the aux placement keeps as this thread's own is the one restore() puts back (a request
+        // with aux_cpus=0), and the host's one CPU must not be it
         cpu_set_t all;
         CPU_ZERO(&all);
         for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
         (void) sched_setaffinity(0, sizeof all, &all);   // the kernel keeps the CPUs the process may use
+        strata::aux_cpus::pin_current_thread();          // (a no-op while the feature is off)
 #endif
     }
     void loop(size_t k) {
@@ -10891,7 +10890,10 @@ int main(int argc, char** argv) {
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     const bool idle_source = !sl.active && sl.cached;
-                    if (sl.cvec != want_cvec || !(idle_source || (sl.active && slot_ckpt_move_env()))) continue;
+                    // (an active slot only where the drafter's rows come along or are not drafted from: the copy
+                    // takes the main layers' cells, so the main drafter would keep another conversation's below it)
+                    const bool active_source = sl.active && slot_ckpt_move_env() && (!use_mtp || batch_mtp || admit_slot >= 0);
+                    if (sl.cvec != want_cvec || !(idle_source || active_source)) continue;
                     if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
                         slot_source = b;
                         slot_tokens = (int64_t) sl.ids.size();
@@ -13003,7 +13005,7 @@ int main(int argc, char** argv) {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
-                    ++dec_windows; dec_T += T;
+                    ++dec_windows; dec_T += merged ? 1 : T;   // a merged window's prompt rows are not decode rows
                 }
                 if (pcie_auto.on) {   // the default share, refined from the CPU pool's speed (PcieAuto); a request's own share is left alone
                     double tc_us = 0.0, rate = 0.0;
