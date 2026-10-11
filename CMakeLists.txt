@@ -82,10 +82,15 @@ if(STRATA_Q6K_EXPERTS)
   add_compile_definitions(STRATA_Q6K_EXPERTS=1)
 endif()
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
-# STRATA_MMQ_DIRECT (opt-in at run time): the prompt path's MMQ reads resident experts in their cache slots through a
-# Strata-side copy of llama.cpp's MMQ scheduler with a per-expert pointer table (src/prefill/moe_mmq_tab.cuh). CUDA
-# only; switched off at configure time when the llama.cpp tree's mmq.cuh is not one the copy was verified against.
-option(STRATA_MMQ_TAB "prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1; CUDA)" ON)
+# CUDA: the pointer-table MMQ behind STRATA_MMQ_DIRECT=1 (the prompt path's MMQ reads resident experts in their cache
+# slots through a Strata-side copy of llama.cpp's MMQ scheduler, src/prefill/moe_mmq_tab.cuh).  Off by default, like
+# the K-quant options above: the engine loads every kernel when it starts (CUDA_MODULE_LOADING=EAGER), and these nine
+# instances (+15 MB of binary) take 36-38 MiB of VRAM per GPU on sm_86 - expert slots every model would lose, with
+# STRATA_MMQ_DIRECT unset too.  They also add ~70% of the upstream MMQ instances' compile time per CUDA arch (175 s
+# of CPU for the nine at sm_86 alone).  Off, the build's device code is byte for byte the one without this feature.  CUDA
+# only (not HIP, not gfx906); switched off at configure time when the llama.cpp tree's mmq.cuh is not one the copy
+# was verified against.
+option(STRATA_MMQ_TAB "Build the pointer-table prompt MMQ for STRATA_MMQ_DIRECT=1 (CUDA; ~37 MiB VRAM per GPU)" OFF)
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
 endif()
@@ -1385,7 +1390,7 @@ if(STRATA_NATIVE_EXPERTS)
     # failing the build.  _strata_mmq_tab_known: the hashes moe_mmq_tab.cuh was verified against (3cf03257, the
     # fetched pin; the vendored third_party/llama.cpp tree has the same mmq.cuh).
     set(_strata_mmq_tab_on OFF)
-    if(STRATA_MMQ_TAB)
+    if(STRATA_MMQ_TAB AND NOT STRATA_HIP_GFX906)   # gfx906 compiles no .cu from here (its HIP glob): no tab at all
       set(_strata_mmq_tab_known 36e4dc716c504470ec09cc0852d29a6ac5eace257f6e5e72db3805ca4f043eb0)
       set(_strata_mmq_tab_hash "")
       if(EXISTS ${_strata_mmq}/mmq.cuh)
@@ -1409,13 +1414,16 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     if(_strata_mmq_tab_on)
       set(_strata_tab_cuh ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_mmq_tab.cuh)
-      foreach(_t IN LISTS _strata_mmq_cuda_types)
+      # the native packs' nine types, the ones prefill_mmq_tab_test checks bit for bit; the optional Q5_0 / K-quant
+      # instances (STRATA_ORCA_Q4KS_MMQ, STRATA_MMQ_KQUANTS) get no pointer table and keep the gather
+      set(_strata_mmq_tab_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+      foreach(_t IN LISTS _strata_mmq_tab_types)
         string(TOUPPER ${_t} _strata_tab_T)
         configure_file(src/prefill/mmq_tab_instance.cu.in ${CMAKE_BINARY_DIR}/mmq_tab/mmq-tab-${_t}.cu @ONLY)
         target_sources(strata_mmq PRIVATE ${CMAKE_BINARY_DIR}/mmq_tab/mmq-tab-${_t}.cu)
       endforeach()
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TAB=1)
-      message(STATUS "STRATA_MMQ_TAB on: pointer-table MMQ for ${_strata_mmq_cuda_types}")
+      message(STATUS "STRATA_MMQ_TAB on: pointer-table MMQ for ${_strata_mmq_tab_types}")
     endif()
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
                                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

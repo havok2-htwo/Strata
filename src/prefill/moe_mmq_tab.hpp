@@ -17,9 +17,6 @@ struct mmq_x_tab {
 template <ggml_type T>
 bool mul_mat_q_tab_case(ggml_backend_cuda_context& ctx, const mmq_args& a, const mmq_x_tab& tab, cudaStream_t s);
 
-#ifdef STRATA_ORCA_Q4KS_MMQ
-extern template bool mul_mat_q_tab_case<GGML_TYPE_Q5_0>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
-#endif
 extern template bool mul_mat_q_tab_case<GGML_TYPE_Q2_0>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
 extern template bool mul_mat_q_tab_case<GGML_TYPE_IQ2_XXS>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
 extern template bool mul_mat_q_tab_case<GGML_TYPE_IQ2_XS>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
@@ -29,13 +26,5 @@ extern template bool mul_mat_q_tab_case<GGML_TYPE_IQ3_S>(ggml_backend_cuda_conte
 extern template bool mul_mat_q_tab_case<GGML_TYPE_IQ4_NL>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
 extern template bool mul_mat_q_tab_case<GGML_TYPE_IQ4_XS>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
 extern template bool mul_mat_q_tab_case<GGML_TYPE_Q8_0>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
-#ifdef STRATA_MMQ_KQUANTS
-extern template bool mul_mat_q_tab_case<GGML_TYPE_Q4_K>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
-extern template bool mul_mat_q_tab_case<GGML_TYPE_Q5_K>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
-#if defined(STRATA_Q6K_EXPERTS)
-extern template bool mul_mat_q_tab_case<GGML_TYPE_Q6_K>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
-#endif
-extern template bool mul_mat_q_tab_case<GGML_TYPE_Q5_1>(ggml_backend_cuda_context&, const mmq_args&, const mmq_x_tab&, cudaStream_t);
-#endif
 
 }  // namespace strata::prefill::mmq

@@ -101,14 +101,15 @@ void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream);
 /// dst = {0, rows} (the bounds of one matrix; dst on the device).
 void set_bounds(int32_t* dst, int32_t rows, void* stream);
 
-// ---- STRATA_MMQ_DIRECT: the prompt MMQ reads resident experts in place (docs: README, "STRATA_MMQ_DIRECT") ----
-/// This build has the pointer-table MMQ (CUDA, STRATA_MMQ_TAB on: the llama.cpp tree matched the mirrored
-/// scheduler's fingerprint).  false under HIP, SYCL and builds without MMQ.
+// ---- STRATA_MMQ_DIRECT: the prompt MMQ reads resident experts in place (docs/DETAILS.md, "STRATA_MMQ_DIRECT") ----
+/// This build has the pointer-table MMQ (CUDA, the build option STRATA_MMQ_TAB on - off by default - and the
+/// llama.cpp tree matched the mirrored scheduler's fingerprint).  false under HIP, gfx906, SYCL and builds without MMQ.
 bool tab_built();
-/// `tab_built`, `fits`, rows a multiple of 128 (no fallback tiles) and a pointer-table instance for the type.
+/// `tab_built`, `fits`, rows a multiple of 128 (no fallback tiles) and a pointer-table instance for the type (the
+/// native packs' nine: Q2_0 IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS Q8_0; not Q5_0 or the K-quants).
 bool tab_fits(int ggml_type, int64_t w_rows);
-/// The bytes past a [rows, cols] matrix that its last row's final K tile reads (the largest K tile of any config
-/// on any visible GPU): 72 for IQ4_NL and 136 for Q8_0 at 640 columns, 0 for IQ3_S at 2560.  0 without MMQ.
+/// The bytes past a [rows, cols] matrix that its last row's final K tile reads (the largest over-read of any
+/// config on any visible GPU): 72 for IQ4_NL and 136 for Q8_0 at 640 columns, 0 for IQ3_S at 2560 (sm_86).  0 without MMQ.
 size_t overread_bytes(int ggml_type, int64_t cols);
 /// The room kept after each sized expert slot's blob for that over-read (the guard).
 constexpr size_t kSlotGuard = 256;

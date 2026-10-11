@@ -65,10 +65,6 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
     for (size_t b = 0; b < nb; ++b) {
         const ggml_fp16_t h = ggml_fp32_to_fp16(sc(rng));
         std::memcpy(m + b * bs, &h, 2);
-        if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1) {
-            const ggml_fp16_t h2 = ggml_fp32_to_fp16(sc(rng) * ((rng() & 1) ? 1.0f : -1.0f));
-            std::memcpy(m + b * bs + 2, &h2, 2);
-        }
     }
 }
 
@@ -413,6 +409,26 @@ int main() {
         const Shape main_shapes[] = {{GGML_TYPE_IQ3_S, 1280, 2560, "gate/up"},
                                      {GGML_TYPE_IQ4_NL, 2560, 640, "down"},
                                      {GGML_TYPE_Q8_0, 2560, 640, "down"}};
+        // the types without a pointer table (the optional Q5_0 / K-quant instances) must keep the gather
+        for (const ggml_type t : {GGML_TYPE_Q5_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q6_K}) {
+            if (mmq::tab_fits((int) t, 1280) || mmq::tab_fits((int) t, 2560)) {
+                std::printf("FAIL: %s reports a pointer table (only the nine tested types have one)\n", ggml_type_name(t));
+                return 1;
+            }
+        }
+        // the over-read each guard must cover: within kSlotGuard, and on sm_86 the values the guards were sized for
+        // (256-value K tiles: 640 columns are 20 blocks of 32, so the last tile reads 4 blocks more - 4 x 18 B of
+        // IQ4_NL, 4 x 34 B of Q8_0; 2560 columns end on a tile)
+        const size_t want_over[] = {0, 72, 136};
+        for (size_t i = 0; i < 3; ++i) {
+            const Shape& sh = main_shapes[i];
+            const size_t ov = mmq::overread_bytes((int) sh.t, sh.cols);
+            if (ov > mmq::kSlotGuard || (prop.major == 8 && prop.minor == 6 && ov != want_over[i])) {
+                std::printf("FAIL: %s over-read %zu B (want %zu, at most %zu)\n", ggml_type_name(sh.t), ov, want_over[i],
+                            mmq::kSlotGuard);
+                return 1;
+            }
+        }
         for (const Shape& sh : main_shapes) {
             if (!mmq::tab_fits((int) sh.t, sh.rows)) {
                 std::printf("FAIL: no pointer-table MMQ for %s\n", ggml_type_name(sh.t));
@@ -427,9 +443,9 @@ int main() {
                                {GGML_TYPE_IQ4_XS, 1280, 2560, "gate/up"},  {GGML_TYPE_Q8_0, 1280, 2560, "gate/up"},
                                {GGML_TYPE_IQ4_NL, 1280, 2560, "gate/up"},  {GGML_TYPE_Q2_0, 2560, 640, "down"}};
         for (const Shape& sh : other) {
-            if (!mmq::tab_fits((int) sh.t, sh.rows)) {
-                std::printf("%-8s %-7s no pointer-table instance here: skipped\n", ggml_type_name(sh.t), sh.role);
-                continue;
+            if (!mmq::tab_fits((int) sh.t, sh.rows)) {   // all nine types have an instance (CMake's tab types)
+                std::printf("FAIL: no pointer-table MMQ for %s %s\n", ggml_type_name(sh.t), sh.role);
+                return 1;
             }
             sweep(ctx, sh, false, rng, s);
         }

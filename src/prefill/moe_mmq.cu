@@ -118,8 +118,10 @@ __global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
+#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
 // STRATA_MMQ_DIRECT: a group's guards (y < g.n, byte stores) and its two zero tails (y == g.n: gate/up, y == g.n + 1:
-// down; uint4 stores when `tail16`, which the host checked: both pointers and the size 16-byte aligned)
+// down; uint4 stores when `tail16`, which the host checked: both pointers and the size 16-byte aligned).  Only in a
+// STRATA_MMQ_TAB build: the engine loads every kernel at start (EAGER), so a build without it keeps today's image.
 __global__ void prep_group_kernel(GuardTab g, int64_t guard, uint8_t* tail_gu, uint8_t* tail_d, int64_t tail, bool tail16) {
     const int y = (int) blockIdx.y;
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -136,15 +138,12 @@ __global__ void prep_group_kernel(GuardTab g, int64_t guard, uint8_t* tail_gu, u
     }
 }
 
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
-// the pointer-table MMQ per type: the same types and #ifdefs as Context::run's switch.  false: no instance
+// the pointer-table MMQ per type: the native packs' nine types (CMake's _strata_mmq_tab_types, all of them checked
+// bit for bit by prefill_mmq_tab_test).  false: no instance - the optional Q5_0 and K-quant experts keep the gather
 bool run_tab(ggml_backend_cuda_context* ctx, const mmq_args* a, const mmq_x_tab* tab, cudaStream_t s) {
     const ggml_type t = a ? a->type_x : GGML_TYPE_COUNT;
 #define STRATA_TAB_CASE(T) case T: return ctx == nullptr || mul_mat_q_tab_case<T>(*ctx, *a, *tab, s)
     switch (t) {
-#ifdef STRATA_ORCA_Q4KS_MMQ
-        STRATA_TAB_CASE(GGML_TYPE_Q5_0);
-#endif
         STRATA_TAB_CASE(GGML_TYPE_Q2_0);
         STRATA_TAB_CASE(GGML_TYPE_IQ2_XXS);
         STRATA_TAB_CASE(GGML_TYPE_IQ2_XS);
@@ -154,14 +153,6 @@ bool run_tab(ggml_backend_cuda_context* ctx, const mmq_args* a, const mmq_x_tab*
         STRATA_TAB_CASE(GGML_TYPE_IQ4_NL);
         STRATA_TAB_CASE(GGML_TYPE_IQ4_XS);
         STRATA_TAB_CASE(GGML_TYPE_Q8_0);
-#ifdef STRATA_MMQ_KQUANTS
-        STRATA_TAB_CASE(GGML_TYPE_Q4_K);
-        STRATA_TAB_CASE(GGML_TYPE_Q5_K);
-#if defined(STRATA_Q6K_EXPERTS)
-        STRATA_TAB_CASE(GGML_TYPE_Q6_K);
-#endif
-        STRATA_TAB_CASE(GGML_TYPE_Q5_1);
-#endif
         default: return false;
     }
 #undef STRATA_TAB_CASE
@@ -329,17 +320,22 @@ bool tab_fits(int t, int64_t w_rows) {
 
 size_t overread_bytes(int t, int64_t cols) {
     if (!supported(t)) return 0;
-    // the longest K tile any (fallback=false) config reads on any visible GPU; MMQ_ITER_K when none is known
-    int64_t k_vram = MMQ_ITER_K;
+    // the K tile's over-read for each (fallback=false) config on any visible GPU, the largest of them: the over-read
+    // is not monotonic in the tile length (20 blocks: 12 more with a 16-block tile, 4 with a 24-block one), so each
+    // config's own; MMQ_ITER_K's is the floor (it is the tile when no config is known)
+    const int64_t qk = ggml_blck_size((ggml_type) t), bpn = cols / qk;
+    auto over = [&](int64_t k_vram) -> int64_t {
+        const int64_t bpi = k_vram / qk;
+        return bpi > 0 ? (bpi - bpn % bpi) % bpi : 0;
+    };
+    int64_t blocks = over(MMQ_ITER_K);
     const ggml_cuda_device_info& info = ggml_cuda_info();
     for (int id = 0; id < info.device_count; ++id)
         for (int J = 8; J <= 128; J += 8) {
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, info.devices[id].cc);
-            if (c.type != GGML_TYPE_COUNT) k_vram = std::max<int64_t>(k_vram, c.K_vram);
+            if (c.type != GGML_TYPE_COUNT) blocks = std::max<int64_t>(blocks, over(c.K_vram));
         }
-    const int64_t qk = ggml_blck_size((ggml_type) t), bpi = k_vram / qk, bpn = cols / qk;
-    if (bpi <= 0) return 0;
-    return (size_t) ((bpi - bpn % bpi) % bpi) * ggml_type_size((ggml_type) t);
+    return (size_t) blocks * ggml_type_size((ggml_type) t);
 }
 
 int direct_mode() {
@@ -360,6 +356,12 @@ int direct_mode() {
 size_t direct_slot_guard() { return direct_mode() != 0 ? kSlotGuard : 0; }
 
 void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail_d, size_t tail_bytes, void* stream) {
+#if !defined(STRATA_MMQ_TAB) || defined(__HIPCC__)
+    // never reached: only a direct group calls it, and direct_mode() is 0 without the pointer-table MMQ
+    (void) g; (void) guard_bytes; (void) tail_gu; (void) tail_d; (void) tail_bytes; (void) stream;
+    std::fprintf(stderr, "prefill mmq: this build has no pointer-table MMQ (STRATA_MMQ_TAB)\n");
+    std::exit(1);
+#else
     const int n = g.n > 0 ? std::min(g.n, kGatherGroupMax) : 0;
     const size_t guard = n > 0 ? guard_bytes : 0;
     const size_t tail = tail_gu || tail_d ? tail_bytes : 0;
@@ -371,6 +373,7 @@ void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail
     prep_group_kernel<<<dim3(blocks((int64_t) span), (unsigned) (gt.n + 2)), 256, 0, (cudaStream_t) stream>>>(
         gt, (int64_t) guard, (uint8_t*) tail_gu, (uint8_t*) tail_d, (int64_t) tail, tail16);
     ck(cudaGetLastError(), "prep_group");
+#endif
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
