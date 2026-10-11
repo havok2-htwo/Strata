@@ -152,6 +152,14 @@ std::string vram_free_note() {
     return buf;
 }
 
+// STRATA_PIPE_OVERLAP: a batch admission's prompt read beside the pipelined slot windows, built only where it was
+// tested (Linux, CUDA); elsewhere the env does nothing.
+#if defined(__linux__) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+constexpr bool kPipeOverlapBuild = true;
+#else
+constexpr bool kPipeOverlapBuild = false;
+#endif
+
 // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
 // A file-backed arena on AMD (STRATA_ARENA_MMAP; the engine raises ROCclr's pin-in-place threshold, see main): an
 // adaptive swap copies one expert straight from the mapped file.  Through ROCclr's staging that copy blocks the host
@@ -9646,6 +9654,22 @@ int main(int argc, char** argv) {
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
+        // STRATA_PIPE_OVERLAP=1: the PLE table is read by a prompt's chunks and the stage-0 windows at once. Switched on
+        // here and nowhere else (off: no lock, plain FIFO reads, as before): the table's lock, the windows' rows as
+        // urgent reads, and in Direct mode STRATA_PIPE_OVERLAP_PLE_RESERVE (default 16) read slots kept for them.
+        static const bool pipe_overlap_env = kPipeOverlapBuild && [] {
+            const char* v = std::getenv("STRATA_PIPE_OVERLAP");
+            return v && v[0] != '0';
+        }();
+        if (pipe_overlap_env && piped) {
+            static const int ple_reserve = [] {
+                const char* v = std::getenv("STRATA_PIPE_OVERLAP_PLE_RESERVE");
+                return v ? std::max(0, std::atoi(v)) : 16;
+            }();
+            ple_table.set_concurrent(true);
+            ple_table.set_urgent_reserve((uint32_t) ple_reserve);
+            for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_ple_urgent(true);
+        }
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
