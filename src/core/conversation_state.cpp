@@ -30,10 +30,10 @@ bool sync(std::string& error) {
     return false;
 }
 
-bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
+bool copy(void* dst, const void* src, size_t bytes, std::string& error, bool queued = false) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
-    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes);
+    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes, queued);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
     return false;
@@ -195,17 +195,18 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
 }
 
 bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
-                                  const ModelGeometry& g, std::string& error) {
+                                  const ModelGeometry& g, std::string& error, bool queued) {
     // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) without the host image, for two
     // sessions carved alike on the same device (a stage's own session and its batch slots): the same bytes into
-    // the same places, through copy() like the restore (the private non-blocking stream, complete on return).
+    // the same places, through copy() like the restore (the private non-blocking stream, complete on return unless
+    // `queued`: then the caller synchronizes the device).
     ConversationStateSizes zf, zt;
     if (!checkpoint_targets(from, g, ids.size(), zf, error) || !checkpoint_targets(to, g, ids.size(), zt, error))
         return false;
     if (zf.gdn != zt.gdn || zf.tail != zt.tail || zf.dead != zt.dead || zf.block_pos != zt.block_pos ||
         owned_qsa(from) != owned_qsa(to) || (from.ple_hist != nullptr) != (to.ple_hist != nullptr))
         return fail(error, "direct copy between differently carved sessions");
-    auto acopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error); };
+    auto acopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error, queued); };
     if (!acopy(to.gdn_state, from.gdn_state, zf.gdn) ||
         !acopy(to.ple_hist, from.ple_hist, from.ple_hist ? zf.ple : 0)) return false;
     for (size_t j = 0; j < owned_qsa(from); ++j) {

@@ -221,7 +221,7 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
 } // namespace
 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
-                          int64_t upto, bool index, std::string& error) {
+                          int64_t upto, bool index, std::string& error, bool queued) {
     Layout lf{}, lt{};
     if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error) ||
         !layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
@@ -234,13 +234,18 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     // The same bytes conversation_kv_save + conversation_kv_restore move, without the host image: each part
     // straight from the source's authoritative pool into the target's (device or mapped host memory), through the
     // private non-blocking stream the other snapshot copies use (complete on return, before the residency refresh).
+    // `queued`: the copies are only queued, and a streamed state's refresh waits for them on the device (an event).
     const auto src = pools(from);
     const auto dst = pools(to);
     const std::array<size_t,5> sizes = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (!sizes[i]) continue;
         if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
-        const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i]);
+        const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
+        if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+    }
+    if (queued && to.kv_mode != 0) {
+        const cudaError_t e = conversation_detail::order_after_queued();
         if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
     }
     return refresh_residency(to, g, upto, error);

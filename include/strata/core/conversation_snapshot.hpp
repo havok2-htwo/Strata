@@ -27,8 +27,10 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
                              int64_t upto, bool include_index, std::string& error);
 // conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.
 // The copies are complete on return; the residency refresh is queued on the legacy stream like the restore's.
+// `queued`: the copies are only queued on the private copy stream, the refresh is ordered after them on the device,
+// and the caller synchronizes the device before it reads or writes either state.
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
-                          int64_t upto, bool include_index, std::string& error);
+                          int64_t upto, bool include_index, std::string& error, bool queued = false);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
@@ -66,8 +68,9 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, S
                                      const ModelGeometry& g, std::string& error);
 // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
 // sessions carved alike on the same device; the caller synchronizes the device before (as for the restore).
+// `queued`: the copies are only queued (the private copy stream), and the caller synchronizes the device after too.
 bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
-                                  const ModelGeometry& g, std::string& error);
+                                  const ModelGeometry& g, std::string& error, bool queued = false);
 
 struct ConversationView {
     const std::vector<int32_t>& ids;
