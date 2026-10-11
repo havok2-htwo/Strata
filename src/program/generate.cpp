@@ -9261,8 +9261,48 @@ int main(int argc, char** argv) {
             return true;
         };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
+        // g3: the main sessions and the slot sessions of a stage live on the same device and are carved alike, so
+        // a slot copy can go device to device (the same bytes into the same places as the checkpoint/K-V image
+        // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
+        // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
+        static const bool slot_copy_direct = [] {
+            const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+            const int64_t upto = (int64_t) ids.size();
+            auto sync_all = [&]() {
+                bool ok = true;
+                for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                    const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                    ok = cudaDeviceSynchronize() == cudaSuccess && ok;
+                }
+                return ok;
+            };
+            // a copy that fails part-way leaves earlier residency refreshes queued on the legacy stream: drain them
+            // before the caller reuses the sessions (its zeroing runs on non-blocking streams, not ordered against these)
+            auto failed = [&]() { (void) sync_all(); return false; };
+            if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                strata::core::SessionState& main_ss = k == 0 ? ss : stages[k - 1]->ss;
+                strata::core::SessionState& slot_ss = *bslot_ss[k][(size_t) b];
+                strata::core::SessionState& from = into_slot ? main_ss : slot_ss;
+                strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
+                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e)) return failed();
+                for (int64_t j = 0; j < from.qsa_alloc; ++j)
+                    if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                        return failed();
+            }
+            if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
+            return true;
+        };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
+            if (slot_copy_direct) {
+                if (!direct_slot_copy(true, b, ids, e)) return false;
+            } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
@@ -9305,6 +9345,9 @@ int main(int argc, char** argv) {
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
+            if (slot_copy_direct && at == nullptr) {
+                if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
+            } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
                 strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
