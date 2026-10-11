@@ -4385,6 +4385,23 @@ int main(int argc, char** argv) {
             batch_mtp = false;
         }
     }
+    // The most slots, up to n, whose windows hold at most kVerifyMaxT rows each: n itself up to that, more only as
+    // pipelined groups on a layer split - the groups as resolved below (a number given, auto, or the default's one
+    // group for --adapt-async 1), dividing the slots, each at most kVerifyMaxT, all at most one group's worth per
+    // stage.  (--batch-mtp: n, as before.)
+    auto slots_in_windows = [&](int n) {
+        const int cap = strata::kernels::kVerifyMaxT;
+        if (batch_mtp || n <= cap) return n;
+        const int asked = o.batch;
+        for (; n > cap; --n) {
+            o.batch = n;
+            const int gr = batch_groups_for(batch_mtp).groups;
+            if (!stages.empty() && gr > 1 && n % gr == 0 && n / gr <= cap && n <= cap * ((int) stages.size() + 1))
+                break;
+        }
+        o.batch = asked;
+        return n;
+    };
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
@@ -4394,17 +4411,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: WARNING: --batch %d is off: %s\n", o.batch, off);
             o.batch = 0;
         } else if (o.batch > cap && !batch_mtp) {
-            // g3: with a layer split the slots flow through the stages in groups, and a group's window holds
-            // batch / groups rows - so up to cap rows per group, one group per stage, i.e. cap * stages slots
-            const int pipe_cap = !stages.empty() && !(o.batch_groups_set && !o.batch_groups_auto && o.batch_groups == 1) ? cap * (int) (stages.size() + 1) : cap;
-            if (o.batch > pipe_cap) {
+            const int n = slots_in_windows(o.batch);
+            if (n < o.batch) {
                 std::fprintf(stderr, "strata generate: WARNING: --batch %d: a batch window holds at most %d rows, so %d "
-                                     "slots\n", o.batch, cap, pipe_cap);
-                o.batch = pipe_cap;
+                                     "slots\n", o.batch, cap, n);
+                o.batch = n;
             }
-            if (o.batch > cap)
-                std::fprintf(stderr, "strata generate: --batch %d over %d stages (g3 patch: up to %d rows per group "
-                                     "window)\n", o.batch, (int) stages.size() + 1, cap);
         }
     }
     // --batch-groups auto: the pipeline needs one group per GPU stage to keep every card busy (4 x R9700, 8 clients:
@@ -4427,13 +4439,6 @@ int main(int argc, char** argv) {
                          r.groups == 1 ? "" : "s", o.batch / r.groups, o.batch / r.groups == 1 ? "" : "s");
     };
     if (o.batch > 0) resolve_groups_auto();
-    if (o.batch > strata::kernels::kVerifyMaxT && !batch_mtp &&
-        (o.batch_groups < 2 || o.batch / std::max(o.batch_groups, 1) > strata::kernels::kVerifyMaxT)) {
-        const int g_ = std::max(o.batch_groups, 1), keep = strata::kernels::kVerifyMaxT * g_;
-        std::fprintf(stderr, "strata generate: WARNING: --batch %d in %d group%s exceeds %d rows per window: %d slots\n",
-                     o.batch, g_, g_ == 1 ? "" : "s", (int) strata::kernels::kVerifyMaxT, keep);
-        o.batch = keep;
-    }
     if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
         std::fprintf(stderr, "strata generate: WARNING: --batch-groups %d needs a layer split and to divide --batch %d; "
                              "one group\n", o.batch_groups, o.batch);
@@ -4480,6 +4485,13 @@ int main(int argc, char** argv) {
             bslot_ss.clear();
             o.batch = 0;
         } else {
+            const int n = slots_in_windows(fit);   // (the slots that fit are held to kVerifyMaxT rows per group too)
+            if (n < fit) {
+                std::fprintf(stderr, "strata generate: WARNING: --batch: %d slot sessions fit, and a batch window holds "
+                                     "at most %d rows, so %d slots\n", fit, (int) strata::kernels::kVerifyMaxT, n);
+                for (auto& v : bslot_ss) v.resize((size_t) n);
+                fit = n;
+            }
             o.batch = fit;
             resolve_groups_auto();   // (the slots that fit may not be the ones asked for)
             if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
@@ -7515,9 +7527,10 @@ int main(int argc, char** argv) {
                 }
         }
         if (n_stages > 1) {
-            // g3: pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
-            // kVerifyMaxT slots the hand-off must hold one row per slot
-            const int hrows = std::max<int>(strata::kernels::kVerifyMaxT, o.batch);
+            // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
+            // kVerifyMaxT slots in groups the hand-off holds one row per slot (otherwise kVerifyMaxT, as before)
+            const int hrows = !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
+                                                               : strata::kernels::kVerifyMaxT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
             for (float*& h : hand) {
@@ -9350,7 +9363,7 @@ int main(int argc, char** argv) {
             return true;
         };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
-        // g3: the main sessions and the slot sessions of a stage live on the same device and are carved alike, so
+        // the main sessions and the slot sessions of a stage live on the same device and are carved alike, so
         // a slot copy can go device to device (the same bytes into the same places as the checkpoint/K-V image
         // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
         // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
@@ -9707,6 +9720,13 @@ int main(int argc, char** argv) {
                          "--batch-mtp's per-slot MTP drafts do not run there (their drafters still hold VRAM, about 0.9 GB per "
                          "slot). Drop --batch-mtp, or use --batch-groups 1.\n", o.batch_groups);
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
+        if (GS > strata::kernels::kVerifyMaxT && !batch_mtp) {   // (slots_in_windows keeps it so: a group's window is
+            // PGroup's rows, and the serial windows reach only the first kVerifyMaxT slots)
+            std::fprintf(stderr, "strata generate: --batch %d in %d group%s: more than %d rows per window\n",
+                         o.batch, std::max(o.batch_groups, 1), o.batch_groups > 1 ? "s" : "",
+                         (int) strata::kernels::kVerifyMaxT);
+            return 1;
+        }
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
