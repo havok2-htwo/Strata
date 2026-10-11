@@ -12603,6 +12603,9 @@ int main(int argc, char** argv) {
                      ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0, (long long) ps.experts_streamed,
                      (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident,
                      (long long) ps.experts_cpu, ps.cpu_share, ps.ms_ple);
+        if (ps.experts_direct > 0)
+            std::fprintf(stderr, "strata generate: prompt MMQ read %lld of the %lld resident experts in their slots "
+                                 "(STRATA_MMQ_DIRECT)\n", (long long) ps.experts_direct, (long long) ps.experts_resident);
     }
 
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
