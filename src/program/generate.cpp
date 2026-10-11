@@ -11386,8 +11386,25 @@ int main(int argc, char** argv) {
             };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 if (pipe_overlap_env() && piped && batch_on()) {
+                    // STRATA_PIPE_OVERLAP_MAX_QUEUE=n: overlap a read only while at most n further admissions wait
+                    // behind it (a read beside the groups takes longer, and admissions queue behind each other); unset
+                    // or negative: always
+                    static const int max_queue = [] {
+                        const char* v = std::getenv("STRATA_PIPE_OVERLAP_MAX_QUEUE");
+                        return v && *v ? std::atoi(v) : -1;
+                    }();
+                    int queued = 0;
+                    if (max_queue >= 0) {
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        for (const std::string& l : in_lines)
+                            if (l.rfind("BGEN ", 0) == 0 || l.rfind("BGENI ", 0) == 0) ++queued;
+                    }
                     std::string why;
-                    if (overlap_gate(a0, b0, why) && overlap_prepare(why)) return read_overlapped(a0, b0, e);
+                    if (max_queue >= 0 && queued > max_queue) {
+                        why = "more admissions queued than STRATA_PIPE_OVERLAP_MAX_QUEUE";
+                        std::fprintf(stderr, "strata batch: read of %lld tokens drained: %d admissions queued behind it\n",
+                                     (long long) (b0 - a0), queued);
+                    } else if (overlap_gate(a0, b0, why) && overlap_prepare(why)) return read_overlapped(a0, b0, e);
                     if (ov_refused_logged.insert(why).second)
                         std::fprintf(stderr, "strata batch: overlapped read off: %s\n", why.c_str());
                 }
