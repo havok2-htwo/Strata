@@ -1423,7 +1423,10 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    with self.slot_cv:                      # the requests waiting behind this admission (the engine
+                        waiting = f" waiting={len(self.wait_lens)}"   # reads a long queue drained: faster per read)
+                    head = (f"BGENI {slot} {left}{keys}{waiting} {embeddings}" if embeddings
+                            else f"BGEN {slot} {left}{keys}{waiting}")
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live

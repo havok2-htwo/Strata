@@ -10303,6 +10303,9 @@ int main(int argc, char** argv) {
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
+            // waiting=N (a batch admission): N further requests wait in the server for their own admission
+            // (STRATA_PIPE_OVERLAP_MAX_QUEUE); absent = unknown
+            int req_waiting = -1;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -10331,6 +10334,7 @@ int main(int argc, char** argv) {
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "waiting") req_waiting = std::atoi(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -11407,8 +11411,9 @@ int main(int argc, char** argv) {
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 if (pipe_overlap_env() && piped && batch_on()) {
                     // STRATA_PIPE_OVERLAP_MAX_QUEUE=n: overlap a read only while at most n further admissions wait
-                    // behind it (a read beside the groups takes longer, and admissions queue behind each other); unset
-                    // or negative: always
+                    // behind it (a read beside the groups takes longer, and admissions queue behind each other): the
+                    // BGEN lines queued here, or the server's count (waiting=N; it sends one admission at a time);
+                    // unset or negative: always
                     static const int max_queue = [] {
                         const char* v = std::getenv("STRATA_PIPE_OVERLAP_MAX_QUEUE");
                         return v && *v ? std::atoi(v) : -1;
@@ -11418,6 +11423,7 @@ int main(int argc, char** argv) {
                         std::lock_guard<std::mutex> lk(in_mu);
                         for (const std::string& l : in_lines)
                             if (l.rfind("BGEN ", 0) == 0 || l.rfind("BGENI ", 0) == 0) ++queued;
+                        queued = std::max(queued, req_waiting);
                     }
                     std::string why;
                     if (max_queue >= 0 && queued > max_queue) {
