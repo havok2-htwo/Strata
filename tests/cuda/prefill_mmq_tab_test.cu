@@ -38,6 +38,7 @@ namespace mmq = strata::prefill::mmq;
 
 constexpr int G = mmq::kGatherGroupMax;
 constexpr size_t TAIL = 4096;
+constexpr int64_t kIdsPad = 2048 + 128;   // > the largest max_rows of the sweep plus one tile
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -97,7 +98,7 @@ struct Acts {
     int64_t total;
     Acts(ggml_type t, int64_t cols, const std::vector<int>& cnt, std::mt19937& rng, cudaStream_t s)
         : x((size_t) std::max<int64_t>(1, sum(cnt)) * cols * 4), xq(mmq::q8_bytes(std::max<int64_t>(1, sum(cnt)), cols)),
-          ids((size_t) std::max<int64_t>(1, sum(cnt)) * 4), bounds((cnt.size() + 1) * 4), total(sum(cnt)) {
+          ids((size_t) (sum(cnt) + kIdsPad) * 4), bounds((cnt.size() + 1) * 4), total(sum(cnt)) {
         std::vector<float> hx((size_t) std::max<int64_t>(1, total) * cols);
         std::normal_distribution<float> nd(0.0f, 1.0f);
         for (auto& v : hx) v = nd(rng);
@@ -105,7 +106,9 @@ struct Acts {
         std::vector<int32_t> hb(cnt.size() + 1, 0);
         for (size_t i = 0; i < cnt.size(); ++i) hb[i + 1] = hb[i] + cnt[i];
         upload(bounds.p, hb.data(), hb.size() * 4, "bounds");
-        mmq::iota((int32_t*) ids.p, std::max<int64_t>(1, total), s);
+        // MMQ loads a whole tile's J ids from an expert's first row, and its stream-k fixup does so for every column
+        // tile of max_rows, also past the last row (upstream behaviour, harmless values): padded for memcheck
+        mmq::iota((int32_t*) ids.p, total + kIdsPad, s);
         if (total > 0) mmq::quantize((const float*) x.p, nullptr, xq.p, (int) t, cols, cols, total, s);
         ck(cudaStreamSynchronize(s), "acts");
     }
