@@ -15,10 +15,17 @@
 // IQ3_S + Q8_0, some read in place (direct), the others gathered at compact positions c != q - one at a time
 // (gather_native) or by gather_native_group with a mid-group flush (first > 0) - including groups whose last entry is
 // direct and groups with no gathered entry; both products bitwise equal to all-gathered.
+// Part 4, STRATA_MMQ_GROUP_SORT: a layer's experts in groups of 16 as prefill.cpp runs them (activations quantized
+// in group order through the src map, absolute bounds, max_rows = the group's largest count), once in ID order and
+// once with the full groups in row-count order (mmq_resident_sort_rows, the partial group kept): every token's
+// product row bitwise equal, when mmq::whole_tiles says so for this card (else only reported). Sorting the partial
+// group too (STRATA_MMQ_RESIDENT_SORT_NE) is reported, not required.
 // Exit 77 without a CUDA device of sm_80 or newer or without the pointer-table build.
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
+
+#include "../../src/prefill/mmq_resident_sort.hpp"
 
 #include <cuda_runtime.h>
 
@@ -386,6 +393,123 @@ void group_case(mmq::Context& ctx, const Pair& pr, const std::vector<int>& cnt, 
     same_bits(ref_d, got_d, out_d, w2.c_str());
 }
 
+
+// Part 4: one layer's experts in groups of G; `span` as mmq_resident_sort_span gives it (0: ID order)
+struct Layer {
+    std::vector<int32_t> ids, count, off, order, slot, src;
+};
+Layer route(const std::vector<int>& cnt, std::mt19937& rng) {
+    Layer L;
+    for (size_t e = 0; e < cnt.size(); ++e)
+        for (int r = 0; r < cnt[e]; ++r) L.ids.push_back((int32_t) e);
+    std::shuffle(L.ids.begin(), L.ids.end(), rng);   // one route per token (K = 1), experts interleaved
+    L.count.assign(cnt.begin(), cnt.end());
+    L.off.assign(cnt.size() + 1, 0);
+    for (size_t e = 0; e < cnt.size(); ++e) L.off[e + 1] = L.off[e] + cnt[e];
+    for (size_t e = 0; e < cnt.size(); ++e)
+        if (cnt[e] > 0) L.order.push_back((int32_t) e);
+    L.slot.assign(L.ids.size(), 0);
+    L.src.assign(L.ids.size(), 0);
+    std::vector<int32_t> fill(L.off.begin(), L.off.end() - 1);
+    for (size_t i = 0; i < L.ids.size(); ++i) {
+        const int32_t p = fill[(size_t) L.ids[i]]++;
+        L.slot[i] = p;
+        L.src[(size_t) p] = (int32_t) i;
+    }
+    return L;
+}
+
+// the layer's product rows in the layer's row order (row p = token src[p])
+std::vector<float> run_layer(mmq::Context& ctx, const Shape& sh, const Layer& L, const std::vector<std::vector<uint8_t>>& w,
+                             const Dev& x, cudaStream_t s) {
+    const int64_t T = (int64_t) L.ids.size();
+    const size_t eb = mmq::matrix_bytes((int) sh.t, sh.rows, sh.cols), n = L.order.size();
+    Dev src((size_t) T * 4), xq(mmq::q8_bytes(T, sh.cols)), ids((size_t) (T + kIdsPad) * 4), bounds((n + 1) * 4);
+    Dev grp((size_t) G * eb + TAIL), out((size_t) T * sh.rows * 4);
+    upload(src.p, L.src.data(), (size_t) T * 4, "src");
+    std::vector<int32_t> hb(n + 1);
+    for (size_t j = 0; j < n; ++j) hb[j] = L.off[(size_t) L.order[j]];
+    hb[n] = (int32_t) T;
+    upload(bounds.p, hb.data(), hb.size() * 4, "bounds");
+    fill_nan(out.b(), out.n);
+    mmq::iota((int32_t*) ids.p, T + kIdsPad, s);
+    mmq::quantize((const float*) x.p, (const int32_t*) src.p, xq.p, (int) sh.t, sh.cols, sh.cols, T, s);
+    for (size_t j0 = 0; j0 < n; j0 += G) {
+        const int ng = (int) std::min<size_t>(G, n - j0);
+        int64_t maxr = 0;
+        ck(cudaStreamSynchronize(s), "group");   // grp is rewritten below
+        for (int q = 0; q < ng; ++q) {
+            const int32_t e = L.order[j0 + (size_t) q];
+            maxr = std::max<int64_t>(maxr, L.count[(size_t) e]);
+            upload(grp.b() + (size_t) q * eb, w[(size_t) e].data(), eb, "grp");
+        }
+        ck(cudaMemset(grp.b() + (size_t) ng * eb, 0, TAIL), "tail");
+        ck(cudaDeviceSynchronize(), "tail");
+        mmq::Product p;
+        p.w = grp.p; p.type = (int) sh.t; p.w_rows = sh.rows; p.w_cols = sh.cols; p.expert_bytes = eb;
+        p.n = ng; p.xq = xq.p; p.bounds = (const int32_t*) bounds.p + j0; p.ids = (const int32_t*) ids.p;
+        p.total_rows = T; p.max_rows = maxr; p.dst = (float*) out.p; p.ld_dst = sh.rows;
+        ctx.run(p, s);
+    }
+    ck(cudaStreamSynchronize(s), "layer");
+    std::vector<float> h((size_t) T * sh.rows);
+    ck(cudaMemcpy(h.data(), out.p, h.size() * 4, cudaMemcpyDeviceToHost), "dtoh layer");
+    return h;
+}
+
+// tokens whose product row differs between two orders of the same layer
+int64_t rows_differing(const Layer& a, const std::vector<float>& ra, const Layer& b, const std::vector<float>& rb, int64_t cols) {
+    int64_t nd = 0;
+    for (size_t t = 0; t < a.ids.size(); ++t)
+        if (std::memcmp(ra.data() + (size_t) a.slot[t] * cols, rb.data() + (size_t) b.slot[t] * cols, (size_t) cols * 4) != 0) ++nd;
+    return nd;
+}
+
+void order_case(mmq::Context& ctx, const Shape& sh, const std::vector<int>& cnt, bool whole, std::mt19937& rng, cudaStream_t s,
+                const char* label) {
+    const size_t eb = mmq::matrix_bytes((int) sh.t, sh.rows, sh.cols);
+    std::vector<std::vector<uint8_t>> w(cnt.size(), std::vector<uint8_t>(eb));
+    for (auto& m : w) fill_matrix(m.data(), sh.t, sh.rows, sh.cols, rng);
+    Layer id = route(cnt, rng);
+    const int64_t T = (int64_t) id.ids.size();
+    Dev x((size_t) T * sh.cols * 4);
+    {
+        std::vector<float> hx((size_t) T * sh.cols);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (auto& v : hx) v = nd(rng);
+        upload(x.p, hx.data(), hx.size() * 4, "x");
+    }
+    Layer full = id, all = id;
+    namespace d = strata::prefill::detail;
+    d::mmq_resident_sort_rows(full.ids.data(), T, 1, full.count, full.off, full.order, full.slot.data(), full.src.data(),
+                              d::mmq_resident_sort_span(full.order.size(), G, true));
+    d::mmq_resident_sort_rows(all.ids.data(), T, 1, all.count, all.off, all.order, all.slot.data(), all.src.data(),
+                              d::mmq_resident_sort_span(all.order.size(), G, false));
+    const size_t n = id.order.size(), tail = n % G;
+    // the partial group's entries and row range stay where they were
+    bool kept = std::equal(id.order.end() - (ptrdiff_t) tail, id.order.end(), full.order.end() - (ptrdiff_t) tail);
+    for (size_t j = n - tail; j < n && kept; ++j) kept = full.off[(size_t) full.order[j]] == id.off[(size_t) id.order[j]];
+    const std::vector<float> r_id = run_layer(ctx, sh, id, w, x, s);
+    const std::vector<float> r_full = run_layer(ctx, sh, full, w, x, s);
+    const std::vector<float> r_all = run_layer(ctx, sh, all, w, x, s);
+    const int64_t d_full = rows_differing(id, r_id, full, r_full, sh.rows), d_all = rows_differing(id, r_id, all, r_all, sh.rows);
+    ++g_cases;
+    const bool ok = kept && (!whole || d_full == 0);
+    if (!ok) ++g_fail;
+    std::printf("  %s %-7s %s: %zu experts (%zu in the partial group), %lld rows: full groups sorted %lld rows differ%s, "
+                "all sorted %lld rows differ%s\n", ggml_type_name(sh.t), sh.role, label, n, tail, (long long) T,
+                (long long) d_full, ok ? "" : (kept ? " FAIL" : " FAIL (partial group moved)"), (long long) d_all,
+                whole ? "" : " (whole_tiles false on this card: reported only)");
+}
+
+std::vector<int> skewed_counts(int n, int lo, int hi, std::mt19937& rng) {
+    // prompt-like: most experts few rows, some many (log-uniform)
+    std::uniform_real_distribution<double> u(std::log((double) lo), std::log((double) hi + 1));
+    std::vector<int> c((size_t) n);
+    for (auto& v : c) v = std::max(lo, (int) std::exp(u(rng)));
+    return c;
+}
+
 }  // namespace
 
 int main() {
@@ -478,6 +602,19 @@ int main() {
             }
         }
         std::printf("mixed groups: %d comparisons, %s\n", g_cases - c0, g_fail == f0 ? "all bitwise identical" : "FAILURES");
+        // Part 4
+        const int f4 = g_fail, c4 = g_cases;
+        const Shape order_shapes[] = {{GGML_TYPE_IQ3_S, 1280, 2560, "gate/up"}, {GGML_TYPE_IQ4_XS, 1280, 2560, "gate/up"},
+                                      {GGML_TYPE_IQ4_NL, 2560, 640, "down"},   {GGML_TYPE_Q8_0, 2560, 640, "down"}};
+        for (const Shape& sh : order_shapes) {
+            const bool whole = mmq::whole_tiles((int) sh.t, sh.rows, G);
+            std::printf("%-8s %-7s whole_tiles(%d experts): %s\n", ggml_type_name(sh.t), sh.role, G, whole ? "yes" : "no");
+            order_case(ctx, sh, skewed_counts(147, 1, 40, rng), whole, rng, s, "150-token prompt");
+            order_case(ctx, sh, skewed_counts(219, 1, 160, rng), whole, rng, s, "512-token chunk");
+            order_case(ctx, sh, skewed_counts(48, 1, 300, rng), whole, rng, s, "no partial group");
+            order_case(ctx, sh, skewed_counts(11, 1, 300, rng), whole, rng, s, "partial group only");
+        }
+        std::printf("group order: %d comparisons, %s\n", g_cases - c4, g_fail == f4 ? "all bitwise identical" : "FAILURES");
         cudaStreamDestroy(s);
         std::printf("%d comparisons, %d failed\n", g_cases, g_fail);
         return g_fail == 0 ? 0 : 1;

@@ -338,6 +338,39 @@ size_t overread_bytes(int t, int64_t cols) {
     return (size_t) blocks * ggml_type_size((ggml_type) t);
 }
 
+bool whole_tiles(int t, int64_t w_rows, int n_experts) {
+    if (!supported(t) || w_rows % 128 != 0 || n_experts <= 0) return false;
+    // launch_mul_mat_q's grid: without stream-k one block per tile; with it one block per tile when the tiles fill
+    // their waves to >= 90 % (NVIDIA), else nsm blocks that split tiles along K at boundaries set by the tile count.
+    // The tile count is nty * n_experts * ntx, ntx = any positive count of J-wide column tiles (max_rows decides),
+    // and ntiles >= 9 * nsm always fills its waves to >= 90 %: the ntx below that are checked one by one.
+    const ggml_cuda_device_info& info = ggml_cuda_info();
+    for (int id = 0; id < info.device_count; ++id) {
+        const int cc = info.devices[id].cc, nsm = info.devices[id].nsm;
+        const size_t smpbo = info.devices[id].smpbo;
+        bool any = false, stream_k = false;
+        ggml_cuda_mmq_config c0 = ggml_cuda_mmq_get_config((ggml_type) t, 8, false, cc);
+        for (int J = 8; J <= 128; J += 8) {
+            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, cc);
+            if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > smpbo) continue;
+            if (!any) c0 = c;
+            any = true;
+            // every tile width accumulates each output over the same K tiles in the same order
+            if (c.I != c0.I || c.K_vram != c0.K_vram || c.sram_layout != c0.sram_layout) return false;
+            stream_k = stream_k || c.stream_k;
+        }
+        if (!any) return false;
+        if (!stream_k) continue;
+        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || nsm <= 0) return false;
+        const int64_t per_ntx = (w_rows / c0.I) * n_experts;
+        for (int64_t ntx = 1; per_ntx * ntx < 9 * (int64_t) nsm + per_ntx; ++ntx) {
+            const int64_t tiles = per_ntx * ntx, waves = (tiles + nsm - 1) / nsm;
+            if (100 * tiles / (nsm * waves) < 90) return false;
+        }
+    }
+    return true;
+}
+
 int direct_mode() {
     static const int mode = [] {
         const char* v = std::getenv("STRATA_MMQ_DIRECT");

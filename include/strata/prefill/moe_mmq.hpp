@@ -113,6 +113,11 @@ bool tab_fits(int ggml_type, int64_t w_rows);
 size_t overread_bytes(int ggml_type, int64_t cols);
 /// The room kept after each sized expert slot's blob for that over-read (the guard).
 constexpr size_t kSlotGuard = 256;
+/// Every launch of `n_experts` experts of [w_rows, *] `ggml_type` weights computes each output tile in one block
+/// with no stream-k K split, and every tile width has the same I/K tiles and SRAM layout, on every visible GPU - so an
+/// expert's rows get the same bits in any such launch, whatever its group-mates and max_rows (STRATA_MMQ_GROUP_SORT).
+/// 160 or 320 tiles per column tile on 82 SMs: yes; 108 or 128 SMs: no (stream-k splits the few-tile launches).
+bool whole_tiles(int ggml_type, int64_t w_rows, int n_experts);
 /// STRATA_MMQ_DIRECT, read once: 0 (default) today's gather; 1 the guard layout and resident experts read in
 /// place; 2 the guard layout with today's gather (the bitwise A/B reference).  0 whenever !tab_built().
 int direct_mode();
