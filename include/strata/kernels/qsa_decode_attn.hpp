@@ -43,4 +43,19 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+/// Up to this many queries of different slots in one qsa_decode_attn_slots call.
+constexpr int kQsaAttnMaxSlots = 8;
+
+/// One KV pool set per query of a qsa_decode_attn_slots call (passed by value as a kernel argument).
+struct QsaAttnSlotPools {
+    QsaAttnPools p[kQsaAttnMaxSlots];
+};
+
+/// qsa_decode_attn_batch for `n_q` queries that each attend over their OWN pools (`pools.p[i]`, one KV cache per batch
+/// slot): one launch instead of one call per query, every block computing exactly what the per-query call computes.
+/// The pools must all have one KV format. False (nothing launched) where the per-query call would run another kernel
+/// (n_q > kQsaAttnMaxSlots, mixed formats, the pre-sm_75 / gfx103x or gfx906 variants): the caller loops instead.
+bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+
 }  // namespace strata::kernels

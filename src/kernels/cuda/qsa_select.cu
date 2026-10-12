@@ -813,12 +813,11 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
 // qsa_block_scores takes it for every call without an active-block count and at most MQ queries: the captured decode
 // window, the uncaptured decode, and prefill's pooled16 call.
 constexpr int MQ = 8;
-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const float* __restrict__ pooled,
-                                                                              const float* __restrict__ dead,
-                                                                              const float* __restrict__ q_idx,
-                                                                              const int32_t* __restrict__ steps, int nq,
-                                                                              int64_t max_blocks, float* __restrict__ out,
-                                                                              bool early_exit) {
+__device__ __forceinline__ void block_scores_multi_body(const float* __restrict__ pooled,
+                                                        const float* __restrict__ dead,
+                                                        const float* __restrict__ q_idx,
+                                                        const int32_t* __restrict__ steps, int nq, int64_t max_blocks,
+                                                        float* __restrict__ out, bool early_exit) {
     __shared__ __align__(16) float qs[MQ * IDX_HEADS * IDX_DIM];
     __shared__ int64_t s_nkv[MQ], s_nbid[MQ];
     if (!early_exit)
@@ -863,6 +862,37 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
             }
         }
     }
+}
+
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(const float* __restrict__ pooled,
+                                                                              const float* __restrict__ dead,
+                                                                              const float* __restrict__ q_idx,
+                                                                              const int32_t* __restrict__ steps, int nq,
+                                                                              int64_t max_blocks, float* __restrict__ out,
+                                                                              bool early_exit) {
+    block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit);
+}
+
+// Queries of different slots, each with its own indexer keys: blockIdx.y is the query, and its CTAs run exactly the
+// single-query call of block_scores_multi_kernel (qsa_block_scores_slots).
+struct ScoreSlotKeys {
+    const float* pooled[MQ];
+    const float* dead[MQ];
+};
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_slots_kernel(ScoreSlotKeys keys,
+                                                                              const float* __restrict__ q_idx,
+                                                                              const int32_t* __restrict__ steps,
+                                                                              int64_t max_blocks, float* __restrict__ out,
+                                                                              bool early_exit) {
+    const unsigned z = blockIdx.y;
+    // the slot's pointers picked by unrolled selects: indexing the argument array by z would copy it to local memory
+    const float* pooled = keys.pooled[0];
+    const float* dead = keys.dead[0];
+#pragma unroll
+    for (unsigned i = 1; i < MQ; ++i)
+        if (z == i) { pooled = keys.pooled[i]; dead = keys.dead[i]; }
+    block_scores_multi_body(pooled, dead, q_idx + (size_t) z * IDX_HEADS * IDX_DIM,
+                            steps + (size_t) z * kStepCount, 1, max_blocks, out + (size_t) z * max_blocks, early_exit);
 }
 
 #if !defined(__HIPCC__)
@@ -1087,7 +1117,37 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
 #endif
 }
 #endif  // !__HIPCC__
+bool scores_multi_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+// STRATA_QSA_EARLY_EXIT=0 keeps the old staging (every CTA loads the queries first); the scores are the same bits
+bool scores_early_exit() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
 }  // namespace
+
+bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
+                            const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
+                            void* stream) {
+    if (nq <= 0) return true;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) {
+        std::fprintf(stderr, "qsa_block_scores_slots: unsupported indexer geometry\n");
+        std::exit(1);
+    }
+    if (nq > MQ || !scores_multi_on()) return false;   // the single-query call would not run the multi kernel
+    ScoreSlotKeys keys{};
+    for (int64_t z = 0; z < nq; ++z) {
+        keys.pooled[z] = pooled[z];
+        keys.dead[z] = dead[z];
+    }
+    block_scores_slots_kernel<<<dim3(256, (unsigned) nq), SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(
+        keys, q_idx, steps, max_blocks, scores, scores_early_exit());
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_slots: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    return true;
+}
 
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
@@ -1097,12 +1157,9 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         std::exit(1);
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
-    static const bool multi = [] { const char* v = std::getenv("STRATA_SCORES_MULTI"); return v == nullptr || std::atoi(v) != 0; }();
-    if (multi && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
-        // STRATA_QSA_EARLY_EXIT=0 keeps the old staging (every CTA loads the queries first); the scores are the same bits
-        static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
+    if (scores_multi_on() && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
         block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, (int) nq,
-                                                                                     max_blocks, scores, early);
+                                                                                     max_blocks, scores, scores_early_exit());
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores multi: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;

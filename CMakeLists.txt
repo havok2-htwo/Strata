@@ -403,6 +403,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
     set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
+    # STRATA_QSA_SLOTS: a batch window's scores, top-k and attention as one launch over rows of different slots
+    # against one call per row, bitwise (synthetic, no model)
+    add_executable(qsa_slots_parity src/kernels/qsa_slots_parity.cpp)
+    target_include_directories(qsa_slots_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qsa_slots_parity PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME qsa_slots_parity COMMAND qsa_slots_parity)
+    add_test(NAME qsa_slots_parity_lanecell COMMAND qsa_slots_parity)
+    set_tests_properties(qsa_slots_parity qsa_slots_parity_lanecell PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(qsa_slots_parity_lanecell PROPERTIES ENVIRONMENT "STRATA_ATTN_LANECELL=1")
   endif()
   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a

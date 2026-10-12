@@ -186,6 +186,11 @@ const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: pe
 // of the commit graph only repeats what the window wrote: the indexer tails are put back and appended again from the
 // same rows, the PLE histories are put back to the window's own snapshot.
 const bool g_batch_self_commit = env_on("STRATA_BATCH_SELF_COMMIT");
+// STRATA_QSA_SLOTS=1 (opt-in): in a batch window, a QSA layer's block scores, top-k and attention run as one launch
+// each over the window's rows (up to 8 per launch, each row reading its own slot's indexer keys and K/V) instead of
+// one call per row; every row is computed by the same kernel with the same arithmetic as its own call.  Not with a
+// streamed KV cache (a row's block resolve could evict the blocks an earlier row of the same slot selected).
+const bool g_qsa_slots = env_on("STRATA_QSA_SLOTS");
 
 // every row of a batch window is another slot's (no slot has proposal rows)
 bool one_row_per_slot(const int* rows, int S) {
@@ -1395,7 +1400,43 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 }
                 stamp(l, 10, grp);
-                if (batch_rec_) {   // each row selects and attends over its own slot's K/V
+                bool streamed = false;   // a streamed KV cache keeps the per-row resolve-then-attend order
+                if (batch_rec_ && g_qsa_slots)
+                    for (int t = tb; t < te; ++t) streamed = streamed || slot_ss(t).qsa_states[qi].kv_mode == 1;
+                if (batch_rec_ && g_qsa_slots && !streamed) {
+                    // the rows' block scores, top-k and attention, up to 8 rows per launch.  The rows only read
+                    // their slots' keys and K/V here and write their own scores/sel/scratch/attn rows, so running
+                    // each step for all rows before the next is the per-row loop's result
+                    for (int t0 = tb; t0 < te; t0 += kQsaAttnMaxSlots) {
+                        const int m = std::min(te - t0, kQsaAttnMaxSlots);
+                        const float* pooled[kQsaAttnMaxSlots];
+                        const float* dead[kQsaAttnMaxSlots];
+                        QsaAttnSlotPools px;
+                        for (int i = 0; i < m; ++i) {
+                            const QsaState& sx = slot_ss(t0 + i).qsa_states[qi];
+                            pooled[i] = sx.idx_pooled;
+                            dead[i] = sx.idx_dead;
+                            px.p[i] = qsa_attn_pools(sx);
+                        }
+                        // a launcher that would not run the per-row call's kernel launches nothing: per-row calls
+                        if (!qsa_block_scores_slots(pooled, dead, qidx_ + t0 * IQ * ID, step_ + t0 * kStepCount, m,
+                                                    max_blocks_, s, scores_ + (size_t) t0 * max_blocks_, cs))
+                            for (int t = t0; t < t0 + m; ++t)
+                                qsa_block_scores(pooled[t - t0], dead[t - t0], qidx_ + t * IQ * ID, step_ + t * kStepCount,
+                                                 1, max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
+                        qsa_block_topk(scores_ + (size_t) t0 * max_blocks_, step_ + t0 * kStepCount, m, max_blocks_,
+                                       cap_, s, sel_ + (size_t) t0 * cap_, cs);
+                        if (!qsa_decode_attn_slots(qcur_ + t0 * NH * HD, px, sel_ + (size_t) t0 * cap_,
+                                                   step_ + t0 * kStepCount, cap_, s,
+                                                   attn_scratch_ + (size_t) t0 * attn_scratch_floats_,
+                                                   attn_ + t0 * NH * HD, m, cs))
+                            for (int t = t0; t < t0 + m; ++t)
+                                qsa_decode_attn_batch(qcur_ + t * NH * HD, px.p[t - t0], sel_ + (size_t) t * cap_,
+                                                      step_ + t * kStepCount, cap_, s,
+                                                      attn_scratch_ + (size_t) t * attn_scratch_floats_,
+                                                      attn_ + t * NH * HD, 1, cs);
+                    }
+                } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
                         qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
