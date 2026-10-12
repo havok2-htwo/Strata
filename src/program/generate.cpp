@@ -10837,6 +10837,13 @@ int main(int argc, char** argv) {
                     if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
                         sl.tainted = true;
                         ++n_running;
+                        // STRATA_SLOT_CKPT_MOVE reads a running slot's checkpoints (and a finished one's: lent_slot):
+                        // they predate the flush, so they go now
+                        if (slot_ckpt_move_env()) {
+                            if (ckpt_pool.on())
+                                for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+                            sl.checks.clear();
+                        }
                     } else if (sl.cached) {
                         sl.cached = false;
                         sl.partial = false;
@@ -10867,7 +10874,7 @@ int main(int argc, char** argv) {
             int64_t moved_in = -1;
             if (slot_ckpt_move_env() && o.prompt_cache > 0 && want_cvec == cvec_cached && live_ok)
                 for (int b = 0; b < (int) bs.size(); ++b) {
-                    if (bs[(size_t) b].cvec != cvec_cached) continue;
+                    if (bs[(size_t) b].cvec != cvec_cached || bs[(size_t) b].tainted) continue;   // (#879)
                     for (const ConvCheckpoint& c : bs[(size_t) b].checks) {
                         const int64_t L = (int64_t) c.ids.size();
                         if (L > resume && L <= (int64_t) live.size() && starts_with(c.ids, c.imgs) &&
@@ -10892,7 +10899,8 @@ int main(int argc, char** argv) {
                     const bool idle_source = !sl.active && sl.cached;
                     // (an active slot only where the drafter's rows come along or are not drafted from: the copy
                     // takes the main layers' cells, so the main drafter would keep another conversation's below it)
-                    const bool active_source = sl.active && slot_ckpt_move_env() && (!use_mtp || batch_mtp || admit_slot >= 0);
+                    const bool active_source = sl.active && !sl.tainted && slot_ckpt_move_env() &&
+                                               (!use_mtp || batch_mtp || admit_slot >= 0);
                     if (sl.cvec != want_cvec || !(idle_source || active_source)) continue;
                     if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
                         slot_source = b;
