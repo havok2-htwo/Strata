@@ -5,9 +5,33 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
+#include <atomic>
+#include <cstddef>
 #include <string>
 
 namespace strata::core {
+
+/// How a capture (conversation_kv_save, conversation_checkpoint_save, conversation_snapshot_save) copies the state
+/// into host memory.  The default is the plain capture: the device is synchronized first, and every copy goes
+/// straight into its target and is complete before the next starts.  A capture on a thread of its own while the
+/// device runs other work (STRATA_PARK_ASYNC) sets:
+struct ConversationCapture {
+    /// false: the caller has already ordered every write of the captured state before the capture (its own device
+    /// synchronization), so the capture waits for its own copies only - no device-wide wait while other streams run
+    bool device_sync = true;
+    /// two pinned host buffers of `staging_bytes` each (cudaHostAlloc): every copy runs through them in blocks, one
+    /// block's transfer beside the host copy of the one before it into its target; null: straight into the target
+    void* staging[2] = {nullptr, nullptr};
+    size_t staging_bytes = 0;
+    /// set by another thread: the capture stops after the block in flight and fails with "cancelled" (not a
+    /// transfer error; the state was only read)
+    const std::atomic<bool>* cancel = nullptr;
+};
+/// The error text of a capture stopped by ConversationCapture::cancel.
+inline const char* conversation_capture_cancelled() { return "conversation snapshot: cancelled"; }
+/// Creates this thread's private copy stream and staging events on the current device, so a later capture on this
+/// thread creates nothing while other threads capture graphs.  false: `error` says why.
+bool conversation_capture_prepare(std::string& error);
 
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
@@ -18,6 +42,9 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
                           int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                          int64_t upto, bool include_index, std::string& error,
+                          int64_t unchanged_tokens, size_t* reused_bytes, const ConversationCapture& how);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
@@ -64,6 +91,8 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, 
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
                                   const ModelGeometry& g, std::string& error);
+bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
+                                  const ModelGeometry& g, std::string& error, const ConversationCapture& how);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
 // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
@@ -119,6 +148,10 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+// The same capture copied as `how` says (the overloads above: ConversationCapture{}).  The image is the same bytes.
+bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
+                                const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                ConversationKvReuse reuse, size_t* reused_bytes, const ConversationCapture& how);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

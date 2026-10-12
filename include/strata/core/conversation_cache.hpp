@@ -145,6 +145,32 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
     return true;
 }
 
+/// What conversation_checkpoints_split(checks, stages) puts in stage `k`'s list (0: `stage0`, k >= 1: `parts[k - 1]`),
+/// COPIED, so `checks` stays as it is: a capture that runs beside the serve loop (STRATA_PARK_ASYNC) reads the chain
+/// while the loop may read it too.  Without a split (stages == 0) every checkpoint as it is.
+inline std::vector<ConversationCheckpoint> conversation_checkpoints_stage_copy(
+        const std::vector<ConversationCheckpoint>& checks, size_t stages, size_t k) {
+    std::vector<ConversationCheckpoint> out;
+    if (stages == 0) {
+        out = checks;
+        return out;
+    }
+    if (k > stages) return out;
+    size_t whole = 0;
+    for (const auto& c : checks) whole += c.stage_parts.size() == stages ? 1 : 0;
+    out.reserve(whole);
+    for (const auto& c : checks) {
+        if (c.stage_parts.size() != stages) continue;
+        const ConversationCheckpoint& state = k == 0 ? c : c.stage_parts[k - 1];
+        ConversationCheckpoint part;
+        part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+        part.gdn = state.gdn; part.ple = state.ple; part.tails = state.tails; part.dead = state.dead;
+        part.block_pos = state.block_pos;
+        out.push_back(std::move(part));
+    }
+    return out;
+}
+
 struct SavedConversation {
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
@@ -172,6 +198,34 @@ struct SavedConversation {
         return n;
     }
 };
+
+/// Every byte, id and mark of two checkpoints alike (stage parts too); vector capacities aside.
+inline bool conversation_checkpoint_same(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
+    if (a.ids != b.ids || a.imgs != b.imgs || a.gdn != b.gdn || a.ple != b.ple || a.tails != b.tails ||
+        a.dead != b.dead || a.block_pos != b.block_pos || a.used != b.used || a.pinned != b.pinned ||
+        a.stage_parts.size() != b.stage_parts.size()) return false;
+    for (size_t i = 0; i < a.stage_parts.size(); ++i)
+        if (!conversation_checkpoint_same(a.stage_parts[i], b.stage_parts[i])) return false;
+    return true;
+}
+inline bool conversation_kv_same(const ConversationKv& a, const ConversationKv& b) {
+    return a.format == b.format && a.cells == b.cells && a.heads == b.heads && a.head_dim == b.head_dim &&
+           a.page_size == b.page_size && a.pooled_rows == b.pooled_rows && a.idx_dim == b.idx_dim &&
+           a.k == b.k && a.v == b.v && a.k_scale == b.k_scale && a.v_scale == b.v_scale && a.pooled == b.pooled;
+}
+/// Two parked images alike in every byte (STRATA_PARK_ASYNC_VERIFY: a capture against another of the same state).
+inline bool conversation_image_same(const SavedConversation& a, const SavedConversation& b) {
+    if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec ||
+        !conversation_checkpoint_same(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() ||
+        a.kv.size() != b.kv.size() || a.stage_images.size() != b.stage_images.size()) return false;
+    for (size_t i = 0; i < a.checkpoints.size(); ++i)
+        if (!conversation_checkpoint_same(a.checkpoints[i], b.checkpoints[i])) return false;
+    for (size_t i = 0; i < a.kv.size(); ++i)
+        if (!conversation_kv_same(a.kv[i], b.kv[i])) return false;
+    for (size_t i = 0; i < a.stage_images.size(); ++i)
+        if (!conversation_image_same(a.stage_images[i], b.stage_images[i])) return false;
+    return true;
+}
 
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
@@ -230,6 +284,10 @@ public:
         if (reuse_.unchanged_tokens <= 0) reuse_ = {};
     }
     ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
+    /// Puts back what take_reuse() returned when nothing used it (a capture that did not start): the same pages and
+    /// extents, as if they had never been taken.
+    void restore_reuse(ConversationKvReuse&& reuse) { reuse_ = std::move(reuse); }
+    size_t budget() const { return budget_; }
     size_t retained_bytes() const { return reuse_.bytes(); }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&

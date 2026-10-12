@@ -236,6 +236,37 @@ bool slot_copy_batchsync_env() {
     }();
     return on;
 }
+// STRATA_PARK_THREADS=1 (read once; off by default): a layer split's park captures every stage's image at once, each
+// on a thread of its own device (ParkThreads), instead of one stage after the other.  Each part is the same capture of
+// the same state, so the parked image is the same
+bool park_threads_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PARK_THREADS");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
+// STRATA_PARK_ASYNC=1 (read once; off by default): the conversation a request leaves in the main sessions is captured
+// right after the request (its DONE / BADM), on one thread per stage device while the batch slots decode, instead of at
+// the next request's start with every slot stopped.  Nothing writes the main sessions until the next request, so the
+// capture is the image a park at that request would take; that request then only decides whether to keep it (parked
+// as before) or not (its K/V pages are kept for the next park, as a restore's are).  Implies STRATA_PARK_THREADS for
+// a park it falls back to.  STRATA_PARK_ASYNC_VERIFY=1 also takes the synchronous capture at every park and requires
+// the same bytes (the engine stops with ERR otherwise)
+bool park_async_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PARK_ASYNC");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
+bool park_async_verify_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PARK_ASYNC_VERIFY");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
 // STRATA_PIPE_OVERLAP's debug knobs (tests only; unset: 0, nothing changes).  STRATA_PIPE_OVERLAP_FORCE_PADUP=1: a group
 // started during an overlapped read always runs padded up (a wider layout whose extra rows park no conversation, else
 // it waits).  STRATA_PIPE_OVERLAP_FORCE_WAIT=1: never padded up, a group whose own layout is missing waits for the
@@ -1626,6 +1657,20 @@ private:
     std::vector<ConvCheckpoint> free_;
 };
 
+/// A thread the engine starts for host copies: off the host thread's one CPU (aux_cpus.hpp), to the aux CPUs (--aux-cpus)
+/// or else to every CPU the process may use.
+static void spread_engine_thread() {
+#if defined(__linux__)
+    // wide first: the mask the aux placement keeps as this thread's own is the one restore() puts back (a request
+    // with aux_cpus=0), and the host's one CPU must not be it
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
+    (void) sched_setaffinity(0, sizeof all, &all);   // the kernel keeps the CPUs the process may use
+    strata::aux_cpus::pin_current_thread();          // (a no-op while the feature is off)
+#endif
+}
+
 /// STRATA_CKPT_THREADS: runs job(0) on the calling thread and job(k), k = 1..n-1, on persistent thread k at the same
 /// time, and returns when all have.  The threads live as long as this object: a short-lived thread would leave its
 /// private copy stream behind on every device it used (conversation_detail::copy_nonblocking).  A thread inherits the
@@ -1664,17 +1709,7 @@ public:
         job_ = nullptr;
     }
 private:
-    static void spread_current_thread() {
-#if defined(__linux__)
-        // wide first: the mask the aux placement keeps as this thread's own is the one restore() puts back (a request
-        // with aux_cpus=0), and the host's one CPU must not be it
-        cpu_set_t all;
-        CPU_ZERO(&all);
-        for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
-        (void) sched_setaffinity(0, sizeof all, &all);   // the kernel keeps the CPUs the process may use
-        strata::aux_cpus::pin_current_thread();          // (a no-op while the feature is off)
-#endif
-    }
+    static void spread_current_thread() { spread_engine_thread(); }
     void loop(size_t k) {
         spread_current_thread();
         uint64_t seen = 0;
@@ -1695,6 +1730,74 @@ private:
     std::condition_variable go_, done_;
     std::vector<std::thread> threads_;
     const std::function<void(size_t)>* job_ = nullptr;
+    size_t n_ = 0, pending_ = 0;
+    uint64_t round_ = 0;
+    bool stop_ = false;
+};
+
+/// STRATA_PARK_ASYNC: the size of each of a stage's two pinned staging blocks (one ConversationBuffer segment)
+constexpr size_t kParkStaging = strata::core::ConversationBuffer::segment_bytes;
+
+/// STRATA_PARK_THREADS / STRATA_PARK_ASYNC: runs job(k), k = 0..n-1, each on persistent thread k (one per stage
+/// device: a thread keeps its private copy stream per device, as StageThreads' do), without waiting: start() returns
+/// at once, wait() when every job of the round has returned.  The threads go where StageThreads' go.  One round at a
+/// time (start() waits for the one before); a job does not throw.
+class ParkThreads {
+public:
+    ParkThreads() = default;
+    ParkThreads(const ParkThreads&) = delete;
+    ParkThreads& operator=(const ParkThreads&) = delete;
+    ~ParkThreads() {
+        wait();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        go_.notify_all();
+        for (std::thread& t : threads_) t.join();
+    }
+    void start(size_t n, std::function<void(size_t)> job) {
+        if (n == 0) return;
+        wait();   // (the round before, if nobody waited for it: one that only frees memory)
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            while (threads_.size() < n) {
+                const size_t k = threads_.size();
+                threads_.emplace_back([this, k] { loop(k); });
+            }
+            job_ = std::move(job);
+            n_ = n;
+            pending_ = n;
+            ++round_;
+        }
+        go_.notify_all();
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lk(mu_);
+        done_.wait(lk, [&] { return pending_ == 0; });
+        job_ = nullptr;
+    }
+private:
+    void loop(size_t k) {
+        spread_engine_thread();
+        uint64_t seen = 0;
+        std::unique_lock<std::mutex> lk(mu_);
+        for (;;) {
+            go_.wait(lk, [&] { return stop_ || round_ != seen; });
+            if (stop_) return;
+            seen = round_;
+            if (k >= n_) continue;   // a round with fewer jobs than threads
+            const std::function<void(size_t)>* job = &job_;
+            lk.unlock();
+            (*job)(k);
+            lk.lock();
+            if (--pending_ == 0) done_.notify_all();
+        }
+    }
+    std::mutex mu_;
+    std::condition_variable go_, done_;
+    std::vector<std::thread> threads_;
+    std::function<void(size_t)> job_;
     size_t n_ = 0, pending_ = 0;
     uint64_t round_ = 0;
     bool stop_ = false;
@@ -8102,6 +8205,70 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // STRATA_PARK_ASYNC: the capture of the main sessions a request left (park_async_start, after it), on one
+        // ParkThreads thread per stage device, that the next request's park decision takes (park_async_take) or stops
+        // (park_async_drop).  Declared before the threads: the threads stop first (park_stop), then this goes
+        struct AsyncPark {
+            bool pending = false;                 ///< a capture was started and not yet taken or dropped
+            std::atomic<bool> cancel{false};      ///< stops the capture between two blocks
+            std::vector<int32_t> live;            ///< what the capture holds: the tokens, pictures and control vector
+            std::vector<ImgKey> live_imgs;        ///  mode of the main sessions when it started
+            bool cvec = true;
+            std::vector<int> dev;                 ///< per stage (0 = the first): its device
+            std::vector<strata::core::SavedConversation> parts;      ///< per stage: its image
+            std::vector<strata::core::ConversationKvReuse> reuse;    ///< per stage: the retained K/V it starts from
+            std::vector<std::string> why;
+            std::vector<char> ok;
+            std::vector<size_t> reused;
+            std::vector<double> ms;
+            std::vector<std::exception_ptr> thrown;
+            std::vector<void*> staging;           ///< per stage: two pinned blocks of kParkStaging bytes
+            Clock::time_point t0;
+            bool off_noted = false;               ///< the once-only line why a capture cannot run beside the slots
+            ~AsyncPark() { for (void* p : staging) if (p != nullptr) cudaFreeHost(p); }
+        } apark;
+        ParkThreads park_threads;   // STRATA_PARK_THREADS / STRATA_PARK_ASYNC (started on first use)
+        struct ParkStop {
+            AsyncPark& a; ParkThreads& t;
+            ~ParkStop() { a.cancel.store(true); t.wait(); }
+        } park_stop{apark, park_threads};
+        const bool park_threads_on = park_threads_env() || park_async_env();
+        bool park_async_on = park_async_env() && conversations.enabled();
+        if (park_async_on) {
+            // the staging blocks and every thread's copy stream and events now, so a capture beside the slots
+            // allocates and creates nothing on the device
+            const size_t n = stages.size() + 1;
+            int main_dev = 0;
+            cudaGetDevice(&main_dev);
+            apark.dev.resize(n);
+            for (size_t k = 0; k < n; ++k) apark.dev[k] = k == 0 ? main_dev : stages[k - 1]->dev;
+            apark.staging.assign(2 * n, nullptr);
+            for (size_t i = 0; i < apark.staging.size() && park_async_on; ++i) {
+                const strata::core::OnDevice on(apark.dev[i / 2]);
+                if (cudaHostAlloc(&apark.staging[i], kParkStaging, cudaHostAllocPortable) != cudaSuccess) {
+                    apark.staging[i] = nullptr;
+                    park_async_on = false;
+                }
+            }
+            std::vector<std::string> why(n);
+            if (park_async_on) {
+                park_threads.start(n, [&](size_t k) {
+                    const strata::core::OnDevice on(apark.dev[k]);
+                    (void) strata::core::conversation_capture_prepare(why[k]);
+                });
+                park_threads.wait();
+                for (const std::string& w : why)
+                    if (!w.empty()) park_async_on = false;
+            }
+            (void) cudaGetLastError();
+            if (park_async_on)
+                std::fprintf(stderr, "strata serve: STRATA_PARK_ASYNC: a finished request's conversation is captured "
+                                     "beside the slots on %zu thread%s (%zu x %zu MiB pinned staging)\n", n,
+                             n == 1 ? "" : "s", apark.staging.size(), kParkStaging >> 20);
+            else
+                std::fprintf(stderr, "strata serve: STRATA_PARK_ASYNC is off: the pinned staging or a copy stream "
+                                     "could not be set up; parking as before\n");
+        }
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
@@ -8228,18 +8395,55 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
-                    auto& st = stages[k];
-                    const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
-                    strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
-                        return false;
-                    image.stage_images.push_back(std::move(part));
+                if (park_threads_on && n_st > 0) {
+                    // STRATA_PARK_THREADS: every stage's capture at once, each on its device's thread; the same calls
+                    // as below (each later stage's device synchronized first), the parts put together in stage order
+                    const size_t n = n_st + 1;
+                    int main_dev = 0;
+                    cudaGetDevice(&main_dev);
+                    std::vector<strata::core::SavedConversation> part(n);
+                    std::vector<std::string> why(n);
+                    std::vector<size_t> reused(n, 0);
+                    std::vector<char> ok(n, 0);
+                    std::vector<std::exception_ptr> thrown(n);
+                    park_threads.start(n, [&](size_t k) {
+                        try {
+                            const strata::core::OnDevice on(k == 0 ? main_dev : stages[k - 1]->dev);
+                            if (k == 0) {
+                                ok[0] = strata::core::conversation_snapshot_save(part[0], view, ss, g, draft0, why[0],
+                                                                                 std::move(reuse), &reused[0]);
+                                return;
+                            }
+                            if (cudaDeviceSynchronize() != cudaSuccess) { why[k] = "stage sync failed"; return; }
+                            const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k - 1], cvec_cached};
+                            ok[k] = strata::core::conversation_snapshot_save(part[k], view_k, stages[k - 1]->ss, g,
+                                        draft_of(k - 1), why[k], std::move(stage_reuse[k - 1]), &reused[k]);
+                        } catch (...) {
+                            thrown[k] = std::current_exception();
+                        }
+                    });
+                    park_threads.wait();
+                    for (size_t k = 0; k < n; ++k)
+                        if (thrown[k]) std::rethrow_exception(thrown[k]);
+                    for (size_t k = 0; k < n; ++k)
+                        if (!ok[k]) { err = why[k]; return false; }
+                    image = std::move(part[0]);
+                    for (size_t k = 1; k < n; ++k) image.stage_images.push_back(std::move(part[k]));
+                    for (size_t k = 0; k < n; ++k) reused_bytes += reused[k];
+                } else {
+                    if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                            std::move(reuse), &reused_bytes)) return false;
+                    for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                        const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                        strata::core::SavedConversation part;
+                        if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                                std::move(stage_reuse[k]), &reused_bytes))
+                            return false;
+                        image.stage_images.push_back(std::move(part));
+                    }
                 }
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
@@ -10256,6 +10460,302 @@ int main(int argc, char** argv) {
                 }
             }
         };
+        // ---- STRATA_PARK_ASYNC (park_async_env, AsyncPark).  Stage k's part of the capture, on its thread: the calls
+        // park_current_body makes, copied through the pinned staging blocks with no device-wide wait (park_async_start
+        // ordered every write of the state before it); the checkpoints are the stage's list as
+        // conversation_checkpoints_split gives it to a park, copied (the loop keeps reading `checks`, nothing writes it
+        // while the capture runs)
+        const std::function<void(size_t)> park_async_job = [&](size_t k) {
+            try {
+                const auto t = Clock::now();
+                const strata::core::OnDevice on(apark.dev[k]);
+                const size_t n_st = stages.size();
+                std::vector<ConvCheckpoint> mine = strata::core::conversation_checkpoints_stage_copy(checks, n_st, k);
+                const std::vector<ConvCheckpoint> none;
+                const strata::core::ConversationView view{apark.live, apark.live_imgs, none, apark.cvec};
+                strata::core::ConversationCapture how;
+                how.device_sync = false;
+                how.staging[0] = apark.staging[2 * k];
+                how.staging[1] = apark.staging[2 * k + 1];
+                how.staging_bytes = kParkStaging;
+                how.cancel = &apark.cancel;
+                // the draft layer's K/V: with the first stage's image without a split, with the last stage's with one
+                const strata::core::QsaState* draft = !use_mtp ? nullptr
+                    : k == 0 ? (n_st > 0 ? nullptr : &mtp.kv_state()) : (k == n_st ? &mtp.kv_state() : nullptr);
+                apark.ok[k] = strata::core::conversation_snapshot_save(apark.parts[k], view, k == 0 ? ss : stages[k - 1]->ss,
+                                  g, draft, apark.why[k], std::move(apark.reuse[k]), &apark.reused[k], how);
+                if (apark.ok[k]) apark.parts[k].checkpoints = std::move(mine);
+                apark.ms[k] = std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+            } catch (...) {
+                apark.thrown[k] = std::current_exception();
+            }
+        };
+        struct ChecksMergeBack {   // park_current_body's: the split checkpoints go back together whichever way it ends
+            strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
+            ~ChecksMergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
+        };
+        // a capture's images are freed on a park thread (their pages go back to the kernel off the request's path)
+        auto park_async_discard = [&]() {
+            auto trash = std::make_shared<std::pair<std::vector<strata::core::SavedConversation>,
+                                                    std::vector<strata::core::ConversationKvReuse>>>(
+                std::move(apark.parts), std::move(apark.reuse));
+            apark.parts.clear();
+            apark.reuse.clear();
+            park_threads.start(1, [trash](size_t) { trash->first.clear(); trash->second.clear(); });
+        };
+        // after a request: start the capture of what the main sessions hold, if a park may want it.  Whatever keeps it
+        // from running beside the slots leaves it to the park at the next request, as without the switch.
+        auto park_async_start = [&]() {
+            if (!park_async_on || apark.pending) return;
+            if (!live_ok || live.empty() || !conversations.wants((int64_t) live.size()) || nan_flush) return;
+            if (kvg.on) {   // the elastic K/V moves cells between requests (kvg_ensure / kvg_trim)
+                if (!apark.off_noted)
+                    std::fprintf(stderr, "strata serve: STRATA_PARK_ASYNC does not run with the elastic K/V; parking "
+                                         "as before\n");
+                apark.off_noted = true;
+                return;
+            }
+            if (pipe_inflight()) return;   // (STRATA_PIPE_OVERLAP: groups running past the request)
+            const size_t n_st = stages.size(), n = n_st + 1;
+            // the request's last work on every device (its commit, the slot copy, the drafter) is done before a copy
+            // starts; no group runs yet (the next pump starts them), so these waits are on this request's work only
+            for (size_t k = 0; k < n; ++k) {
+                const strata::core::OnDevice on(apark.dev[k]);
+                if (cudaDeviceSynchronize() != cudaSuccess) return;   // (the next request meets the fault)
+            }
+            std::string e;
+            if (use_mtp && !mtp.idle(e)) return;
+            // park_current_body's estimate and its RAM admission, without evicting anything: a capture that may not
+            // be kept must not cost a parked conversation (the one the next request restores, oldest first).  What
+            // does not fit is left to the park at the next request, which may evict
+            const strata::core::QsaState* draft0 = n_st > 0 || !use_mtp ? nullptr : &mtp.kv_state();
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
+            strata::core::ConversationKvReuse reuse = conversations.take_reuse();
+            std::vector<char> keep(n, 0);   // stage k's retained K/V is valid for this capture
+            size_t estimate = 0, retained = 0;
+            bool fits = true;
+            try {
+                strata::core::ConversationCheckpointSplit cs;
+                if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);
+                ChecksMergeBack merge_back{cs, checks, n_st > 0};
+                const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
+                size_t stage_estimate = 0;
+                for (size_t k = 0; k < n_st && fits; ++k) {
+                    const strata::core::OnDevice on(stages[k]->dev);
+                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                    size_t b = 0;
+                    if (!strata::core::conversation_snapshot_bytes(view_k, stages[k]->ss, g, draft_of(k), b, e)) {
+                        fits = false;
+                        break;
+                    }
+                    if (k < reuse.stages.size() && !reuse.stages[k].kv.empty()) {
+                        size_t r = 0;
+                        if (strata::core::conversation_snapshot_capture_bytes(reuse.stages[k], view_k, stages[k]->ss, g,
+                                                                              draft_of(k), r, e)) {
+                            b = r;
+                            retained += reuse.stages[k].bytes();
+                            keep[k + 1] = 1;
+                        }
+                    }
+                    stage_estimate += b;
+                }
+                if (fits && strata::core::conversation_snapshot_bytes(view, ss, g, draft0, estimate, e)) {
+                    const size_t fresh = estimate;
+                    if (!reuse.kv.empty()) {
+                        if (strata::core::conversation_snapshot_capture_bytes(reuse, view, ss, g, draft0, estimate, e)) {
+                            retained += reuse.kv.capacity() * sizeof(strata::core::ConversationKv);
+                            for (const auto& l : reuse.kv) retained += l.bytes();
+                            keep[0] = 1;
+                        } else {
+                            estimate = fresh;
+                        }
+                    }
+                    estimate += stage_estimate;
+                } else {
+                    fits = false;
+                }
+            } catch (const std::bad_alloc&) {
+                fits = false;
+            }
+            if (fits) fits = estimate <= conversations.budget();
+            if (fits) {
+                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                const auto mem = strata::core::sample_host_memory();
+                fits = strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt,
+                                                               estimate > retained ? estimate - retained : 0, floor);
+            }
+            if (!fits) {
+                conversations.restore_reuse(std::move(reuse));
+                return;
+            }
+            try {
+                apark.live = live;
+                apark.live_imgs = live_imgs;
+                apark.cvec = cvec_cached;
+                apark.parts.clear();
+                apark.parts.resize(n);
+                apark.reuse.clear();
+                apark.reuse.resize(n);
+                apark.why.assign(n, std::string());
+                apark.ok.assign(n, 0);
+                apark.reused.assign(n, 0);
+                apark.ms.assign(n, 0.0);
+                apark.thrown.assign(n, nullptr);
+                std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
+                stage_reuse.resize(n_st);
+                reuse.stages.clear();
+                if (keep[0]) apark.reuse[0] = std::move(reuse);
+                for (size_t k = 0; k < n_st; ++k)
+                    if (keep[k + 1]) apark.reuse[k + 1] = std::move(stage_reuse[k]);
+            } catch (const std::bad_alloc&) {
+                apark.parts.clear();
+                apark.reuse.clear();
+                return;   // (the retained K/V is gone: the next park copies everything)
+            }
+            apark.cancel.store(false);
+            apark.pending = true;
+            apark.t0 = Clock::now();
+            park_threads.start(n, park_async_job);
+        };
+        // stop a capture and drop it (#879's flush, VRAM, SAVE / RESTORE: they change what it reads)
+        auto park_async_drop = [&]() {
+            if (!apark.pending) return;
+            apark.cancel.store(true);
+            park_threads.wait();
+            apark.pending = false;
+            park_async_discard();
+        };
+        // STRATA_PARK_ASYNC_VERIFY: the synchronous capture park_current_body takes, without retained K/V
+        auto park_capture_sync = [&](strata::core::SavedConversation& out) -> bool {
+            const size_t n_st = stages.size();
+            const strata::core::QsaState* draft0 = n_st > 0 || !use_mtp ? nullptr : &mtp.kv_state();
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
+            strata::core::ConversationCheckpointSplit cs;
+            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);
+            ChecksMergeBack merge_back{cs, checks, n_st > 0};
+            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
+            if (!strata::core::conversation_snapshot_save(out, view, ss, g, draft0, err)) return false;
+            for (size_t k = 0; k < n_st; ++k) {
+                const strata::core::OnDevice on(stages[k]->dev);
+                if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                strata::core::SavedConversation part;
+                if (!strata::core::conversation_snapshot_save(part, view_k, stages[k]->ss, g, draft_of(k), err)) return false;
+                out.stage_images.push_back(std::move(part));
+            }
+            return true;
+        };
+        // the park decision with a capture running: `due` - park it (as park_current would: superseded copies, the
+        // budget, the RAM floor, then the cache); not due - stop it, and a complete one's K/V pages are kept for the
+        // next park (the session's cells [0, live), as after a restore; this request's rewrites limit them).  false:
+        // `err` says why (a failed copy, as a park's)
+        auto park_async_take = [&](bool due, size_t held) -> bool {
+            const auto tw = Clock::now();
+            if (!due) apark.cancel.store(true);
+            park_threads.wait();
+            apark.pending = false;
+            const double wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+            const size_t n = apark.parts.size();
+            bool complete = n > 0;
+            double capture_ms = 0.0;
+            for (size_t k = 0; k < n; ++k) {
+                complete = complete && apark.ok[k] && !apark.thrown[k];
+                capture_ms = std::max(capture_ms, apark.ms[k]);
+            }
+            // nothing writes the main sessions between the capture's start and here: the same tokens say so
+            const bool same = live_ok && apark.live == live && apark.live_imgs == live_imgs && apark.cvec == cvec_cached;
+            if (!due) {
+                if (complete && same && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                    std::vector<std::vector<strata::core::ConversationKv>> stage_kv;
+                    for (size_t k = 1; k < n; ++k) stage_kv.push_back(std::move(apark.parts[k].kv));
+                    conversations.retain(std::move(apark.parts[0].kv), (int64_t) live.size(), std::move(stage_kv));
+                }
+                park_async_discard();
+                return true;
+            }
+            for (size_t k = 0; k < n; ++k)
+                if (apark.thrown[k]) {
+                    try {
+                        std::rethrow_exception(apark.thrown[k]);
+                    } catch (const std::bad_alloc&) {
+                        std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
+                        park_async_discard();
+                        return true;
+                    }
+                }
+            for (size_t k = 0; k < n; ++k)
+                if (!apark.ok[k]) {
+                    err = apark.why[k];
+                    park_async_discard();
+                    return false;
+                }
+            if (!same) {
+                std::fprintf(stderr, "strata serve: conversation cache: the capture beside the slots no longer matches "
+                                     "the live conversation (a bug); parking it now instead\n");
+                park_async_discard();
+                return park_current(held);
+            }
+            try {
+                strata::core::SavedConversation image = std::move(apark.parts[0]);
+                size_t reused_bytes = apark.reused[0];
+                for (size_t k = 1; k < n; ++k) {
+                    image.stage_images.push_back(std::move(apark.parts[k]));
+                    reused_bytes += apark.reused[k];
+                }
+                park_async_discard();
+                if (park_async_verify_env()) {
+                    strata::core::SavedConversation ref;
+                    if (!park_capture_sync(ref)) return false;
+                    if (!strata::core::conversation_image_same(image, ref)) {
+                        err = "STRATA_PARK_ASYNC_VERIFY: the capture beside the slots differs from the synchronous capture";
+                        return false;
+                    }
+                    std::fprintf(stderr, "strata serve: STRATA_PARK_ASYNC_VERIFY: %zu tokens, %zu bytes identical\n",
+                                 live.size(), ref.bytes());
+                }
+                // park_current_body's steps around its capture, in its order
+                if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+                    std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
+                                 "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+                if (!conversations.make_room(image.bytes(), held)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
+                                 image.bytes() >> 20);
+                    return true;
+                }
+                // the RAM floor beside the capture (its pages are in already): the least recently active parked
+                // conversations go until it holds, as the park's admission gate evicts for its capture
+                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                size_t evicted = 0;
+                std::optional<strata::core::HostMemoryReading> mem;
+                auto admit = [&] {
+                    mem = strata::core::sample_host_memory();
+                    return strata::core::conversation_memory_admit(
+                        mem ? std::optional<uint64_t>(mem->available) : std::nullopt, 0, floor);
+                };
+                while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
+                       conversations.evict_oldest())
+                    ++evicted;
+                if (!admit()) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s; evicted %zu, %zu still parked)\n",
+                                 (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(), evicted,
+                                 conversations.size());
+                    return true;
+                }
+                if (evicted)
+                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%lld MiB floor)\n",
+                                 evicted, evicted == 1 ? "" : "s", (long long) o.conversation_cache_min_free_mib);
+                const size_t snapshot_bytes = image.bytes();
+                const bool stored = conversations.put(std::move(image), held);
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu capture=async capture_ms=%.1f wait_ms=%.1f\n",
+                             stored ? "parked" : "skipped", live.size(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - tw).count(),
+                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes,
+                             reused_bytes, capture_ms, wait_ms);
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
+            }
+            return true;
+        };
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -10307,6 +10807,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
+                park_async_drop();   // (STRATA_PARK_ASYNC: it may move the sessions' memory)
                 std::string verr;
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
                 else vram_command(line, verr);
@@ -10369,6 +10870,7 @@ int main(int argc, char** argv) {
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+                park_async_drop();   // (STRATA_PARK_ASYNC: a session restore rewrites what it reads)
                 const bool save = line[0] == 'S';
                 const std::string path = line.substr(save ? 5 : 8);
                 const auto t0 = Clock::now();
@@ -10826,6 +11328,7 @@ int main(int argc, char** argv) {
             // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
             // conversation and every idle batch slot go, and this prompt is read from token 0 (resume == 0 below)
             if (nan_flush) {
+                park_async_drop();   // (STRATA_PARK_ASYNC: nothing of it is kept, and it reads `checks`)
                 nan_flush = false;
                 const size_t n_checks = checks.size();
                 live_ok = false;
@@ -10952,12 +11455,22 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
+            const bool park_due = (!from_live || incoming || slot_source >= 0) && !pin_sibling;
+            if (apark.pending) {   // STRATA_PARK_ASYNC: the capture started after the last request
+                if (!park_async_take(park_due, incoming ? incoming->bytes() : 0)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+            } else if (park_due && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
+                // STRATA_PARK_ASYNC: K/V pages retained from a restore describe the cells this copy overwrites with
+                // another conversation's (a park that did not run - live_ok was false - left them): they go, as at a
+                // session restore, so no later capture takes them for this conversation's
+                if (park_async_on) conversations.take_reuse();
                 const auto t0 = Clock::now();
                 if (!copy_from_slot(slot_source, slot_ck, err)) {
                     // the main session may be half written: read this prompt from the start
@@ -13494,6 +14007,7 @@ int main(int argc, char** argv) {
                 helper_blobs_before = blobs;
                 helper_bytes_before = bytes;
             }
+            park_async_start();   // STRATA_PARK_ASYNC: the conversation the request leaves, captured beside the slots
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
         return 0;

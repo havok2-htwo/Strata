@@ -154,20 +154,33 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
 
 bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
                                   const ModelGeometry& g, std::string& error) {
+    return conversation_checkpoint_save(c, ss, g, error, ConversationCapture{});
+}
+
+bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
+                                  const ModelGeometry& g, std::string& error, const ConversationCapture& how) {
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    // the plain capture copies as it always has; a staged or stoppable one through StagedCopy (the same bytes)
+    const bool plain = how.staging[0] == nullptr && how.cancel == nullptr;
+    conversation_detail::StagedCopy staged(how.staging, how.staging_bytes, how.cancel);
+    auto save = [&](void* dst, const void* src, size_t bytes) {
+        if (plain || !bytes) return copy(dst, src, bytes, error);
+        if (!dst || !src) return fail(error, "missing running-state buffer");
+        return staged.copy(dst, src, bytes, error);
+    };
+    if (!save(c.gdn.data(), ss.gdn_state, c.gdn.size()) ||
+        !save(c.ple.data(), ss.ple_hist, c.ple.size())) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!save(c.tails.data() + j * z.tail, st.idx_tail, z.tail) ||
+            !save(c.dead.data() + j * z.dead, st.idx_dead, z.dead) ||
+            !save(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos)) return false;
     }
-    return true;
+    return plain || staged.finish(error);
 }
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
@@ -281,8 +294,27 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes) {
+    return conversation_snapshot_save(image, view, ss, g, draft, error, std::move(reuse), reused_bytes,
+                                      ConversationCapture{});
+}
+
+bool conversation_capture_prepare(std::string& error) {
+    cudaStream_t s = nullptr;
+    std::array<cudaEvent_t, 2> ev{};
+    cudaError_t e = conversation_detail::private_stream(s);
+    if (e == cudaSuccess) e = conversation_detail::staging_events(ev);
+    if (e == cudaSuccess) return true;
+    error = std::string("conversation snapshot copy stream: ") + cudaGetErrorString(e);
+    return false;
+}
+
+bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+                                const SessionState& ss, const ModelGeometry& g,
+                                const QsaState* draft, std::string& error,
+                                ConversationKvReuse reuse, size_t* reused_bytes, const ConversationCapture& how) {
     size_t estimate = 0;
-    if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
+    if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) ||
+        (how.device_sync && !sync(error))) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.
     SavedConversation captured;
     captured.geometry = geometry_key(g);
@@ -293,15 +325,15 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);
     captured.kv.resize(layers + (draft ? 1 : 0));
-    if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    if (!conversation_checkpoint_save(captured.live, ss, g, error, how)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+                                  unchanged, reused_bytes, how)) return false;
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+                                       std::max<int64_t>(0, unchanged - 1), reused_bytes, how)) return false;
     image = std::move(captured);
     return true;
 }

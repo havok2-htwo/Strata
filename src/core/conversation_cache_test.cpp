@@ -327,6 +327,85 @@ int main() {
               back[0].stage_parts.size() == 2, "a restored image's parts are all whole");
         auto none = conversation_checkpoints_split({}, 3);
         check(conversation_checkpoints_merge(std::move(none), back) && back.empty(), "no checkpoints: nothing to do");
+
+        // STRATA_PARK_ASYNC: each stage's list copied out of the chain is what split moves into it, and the chain
+        // stays as it is
+        std::vector<ConversationCheckpoint> chain = original;
+        chain[2].pinned = true;
+        chain[0].tails.assign(16, 4);
+        chain[2].stage_parts[0].dead.assign(8, 6);
+        const auto before = chain;
+        auto moved = conversation_checkpoints_split(std::vector<ConversationCheckpoint>(chain), 2);
+        for (size_t k = 0; k <= 2; ++k) {
+            const auto copied = conversation_checkpoints_stage_copy(chain, 2, k);
+            const auto& want = k == 0 ? moved.stage0 : moved.parts[k - 1];
+            bool equal = copied.size() == want.size();
+            for (size_t j = 0; equal && j < copied.size(); ++j) equal = conversation_checkpoint_same(copied[j], want[j]);
+            check(equal, "stage copy == the split's list for that stage");
+            size_t bytes_c = 0, bytes_w = 0;   // what a parked image is charged: the copy a capture makes of the list
+            for (const auto& c : copied) bytes_c += c.bytes();
+            for (const auto& c : std::vector<ConversationCheckpoint>(want)) bytes_w += c.bytes();
+            check(bytes_c == bytes_w && copied.capacity() == std::vector<ConversationCheckpoint>(want).capacity(),
+                  "stage copy is charged like the capture's copy of the split's list");
+        }
+        bool kept = chain.size() == before.size();
+        for (size_t j = 0; kept && j < chain.size(); ++j) kept = conversation_checkpoint_same(chain[j], before[j]);
+        check(kept, "stage copy leaves the chain as it was");
+        check(conversation_checkpoints_stage_copy(chain, 2, 3).empty(), "no such stage: nothing");
+        const auto whole = conversation_checkpoints_stage_copy(chain, 0, 0);
+        bool all = whole.size() == chain.size();
+        for (size_t j = 0; all && j < whole.size(); ++j) all = conversation_checkpoint_same(whole[j], chain[j]);
+        check(all, "no layer split: every checkpoint as it is");
+
+        // the deep comparison a verified capture uses: any byte, stamp or mark that differs is seen
+        auto ck = chain[2];
+        check(conversation_checkpoint_same(ck, chain[2]), "a checkpoint is the same as its copy");
+        ck.stage_parts[1].gdn[5] ^= 1;
+        check(!conversation_checkpoint_same(ck, chain[2]), "a stage part's byte differs");
+        ck = chain[2]; ck.used += 1;
+        check(!conversation_checkpoint_same(ck, chain[2]), "the LRU stamp differs");
+        ck = chain[2]; ck.pinned = false;
+        check(!conversation_checkpoint_same(ck, chain[2]), "the pin differs");
+        SavedConversation a = image({1, 2, 3});
+        a.kv.resize(2);
+        a.kv[1].k.resize(100, 3);
+        a.kv[1].cells = 64;
+        a.checkpoints.push_back(chain[0]);
+        a.stage_images.push_back(image({1, 2, 3}));
+        a.stage_images[0].kv.resize(1);
+        a.stage_images[0].kv[0].pooled.resize(50, 2);
+        SavedConversation b = a;
+        b.kv[1].k = ConversationBuffer();   // grown in two steps: other segment capacities, the same content
+        b.kv[1].k.resize(50, 3);
+        b.kv[1].k.resize(100, 3);
+        b.checkpoints[0].gdn.reserve(4096);
+        check(conversation_image_same(a, b), "an image is the same as its copy");
+        b.stage_images[0].kv[0].pooled.visit(49, 1, [](uint8_t* p, size_t, size_t) { *p ^= 1; return true; });
+        check(!conversation_image_same(a, b), "a later stage's K/V byte differs");
+        b = a; b.kv[1].cells = 128;
+        check(!conversation_image_same(a, b), "the K/V geometry differs");
+        b = a; b.checkpoints[0].tails[3] ^= 1;
+        check(!conversation_image_same(a, b), "a checkpoint byte differs");
+        b = a; b.live.ids.push_back(4);
+        check(!conversation_image_same(a, b), "the live tokens differ");
+        b = a; b.cvec = !b.cvec;
+        check(!conversation_image_same(a, b), "the control vector mode differs");
+    }
+    {
+        // a capture that did not start puts the retained K/V back as it was taken
+        ConversationCache cache(1 << 20, 4);
+        std::vector<ConversationKv> kv(1);
+        kv[0].k.resize(1000, 1);
+        cache.retain(std::move(kv), 40);
+        cache.limit_reuse(30);
+        const size_t held = cache.retained_bytes();
+        auto r = cache.take_reuse();
+        check(cache.retained_bytes() == 0 && r.unchanged_tokens == 30 && r.captured_tokens == 40, "take_reuse takes them");
+        cache.restore_reuse(std::move(r));
+        check(cache.retained_bytes() == held && cache.budget() == (1u << 20), "restore_reuse puts them back");
+        const auto again = cache.take_reuse();
+        check(again.unchanged_tokens == 30 && again.captured_tokens == 40 && again.kv.size() == 1 &&
+              again.kv[0].k.size() == 1000, "with the same extents");
     }
     {
         // the later stages' retained K/V, kept with the first stage's and limited together

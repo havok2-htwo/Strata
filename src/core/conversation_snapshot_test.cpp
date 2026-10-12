@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -151,6 +152,30 @@ void full_session(int fmt, int mode, int experts) {
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
     fill(177);
     check(conversation_snapshot_save(b,view,ss,g,draft.state,err),"capture complete B");
+    // STRATA_PARK_ASYNC: the capture through two small pinned staging blocks (an odd size: every part crosses blocks),
+    // with no device-wide wait (the fixture synchronized), gives the same image; a stopped one fails as cancelled
+    std::array<void*,2> staging{};
+    for (void*& p : staging) cuda_check(cudaHostAlloc(&p,777,cudaHostAllocPortable));
+    std::atomic<bool> stop{false};
+    ConversationCapture how;
+    how.device_sync=false; how.staging[0]=staging[0]; how.staging[1]=staging[1]; how.staging_bytes=777; how.cancel=&stop;
+    check(conversation_capture_prepare(err),"this thread's copy stream and staging events");
+    {
+        SavedConversation staged,direct_image,stopped;
+        check(conversation_snapshot_save(staged,view,ss,g,&draft.state,err,{},nullptr,how),"staged capture of B");
+        check(conversation_image_same(staged,b),"a staged capture is the plain capture's image");
+        ConversationCapture direct;   // stoppable, no staging: straight copies
+        direct.device_sync=false; direct.cancel=&stop;
+        check(conversation_snapshot_save(direct_image,view,ss,g,&draft.state,err,{},nullptr,direct) &&
+              conversation_image_same(direct_image,b),"a stoppable capture without staging is the same image");
+        stop.store(true);
+        check(!conversation_snapshot_save(stopped,view,ss,g,&draft.state,err,{},nullptr,how) &&
+              err==conversation_capture_cancelled(),"a stopped capture fails as cancelled");
+        stop.store(false);
+        SavedConversation again;
+        check(conversation_snapshot_save(again,view,ss,g,&draft.state,err,{},nullptr,how) && conversation_image_same(again,b),
+              "the staging blocks are whole after a stopped capture");
+    }
     {
         // disk save path: metadata + streamed K/V give the same file as the captured image
         SavedConversation meta;
@@ -196,6 +221,7 @@ void full_session(int fmt, int mode, int experts) {
     for (int64_t dirty : {65, 3, 0}) {
         check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore growth fixture base");
         ConversationKvReuse reuse{a.kv,65,dirty};
+        ConversationKvReuse staged_reuse{a.kv,65,dirty,{}};
         const uint8_t* original = nullptr;
         reuse.kv[0].k.visit(0,1,[&](const uint8_t* p,size_t,size_t){original=p;return true;});
         main.fill_after(91,dirty); draft.fill_after(91,std::max<int64_t>(0,dirty-1));
@@ -214,6 +240,12 @@ void full_session(int fmt, int mode, int experts) {
               incremental.live.dead==fresh.live.dead && equal(incremental.kv[0],fresh.kv[0]) &&
               equal(incremental.kv[1],fresh.kv[1]),"incremental capture equals full capture after growth or rewind");
         check((dirty>=4)==(reused>0),"only complete unchanged pages or rows are retained");
+        SavedConversation staged_incremental;
+        size_t staged_reused=0;
+        check(conversation_snapshot_save(staged_incremental,view,ss,g,&draft.state,err,std::move(staged_reuse),
+                                         &staged_reused,how) && staged_reused==reused &&
+              conversation_image_same(staged_incremental,incremental),
+              "a staged capture with retained pages equals the plain one");
         incremental.kv[0].k.visit(0,1,[&](const uint8_t* p,size_t,size_t){
             check(p==original,"growth never reallocates the retained payload");return true;
         });
@@ -268,6 +300,7 @@ void full_session(int fmt, int mode, int experts) {
     cuda_check(cudaMemcpy(spare.data(),main.state.idx_pooled,sizes.dead,cudaMemcpyDeviceToHost));
     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
+    for (void* p : staging) cudaFreeHost(p);
 }
 }
 

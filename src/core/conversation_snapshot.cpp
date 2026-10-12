@@ -147,6 +147,15 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
                           int64_t unchanged_tokens, size_t* reused_bytes) {
+    return conversation_kv_save(image, st, g, upto, index, error, unchanged_tokens, reused_bytes, ConversationCapture{});
+}
+
+bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                          int64_t upto, bool index, std::string& error,
+                          int64_t unchanged_tokens, size_t* reused_bytes, const ConversationCapture& how) {
+    // the plain capture copies as it always has; a staged or stoppable one through StagedCopy (the same bytes)
+    const bool plain = how.staging[0] == nullptr && how.cancel == nullptr;
+    conversation_detail::StagedCopy staged(how.staging, how.staging_bytes, how.cancel);
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -173,11 +182,13 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                if (plain) return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                if (n && !src[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+                return staged.copy(p, static_cast<const uint8_t*>(src[i]) + at, n, error);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
-    return true;
+    return plain || staged.finish(error);
 }
 
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
