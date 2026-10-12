@@ -357,6 +357,22 @@ int main() {
         for (size_t j = 0; all && j < whole.size(); ++j) all = conversation_checkpoint_same(whole[j], chain[j]);
         check(all, "no layer split: every checkpoint as it is");
 
+        // STRATA_SLOT_PARK: the chain a slot's image takes along leaves out the turn checkpoints of earlier slot images
+        chain[2].slot_turn = true;
+        for (size_t k = 0; k <= 2; ++k) {
+            const auto along = conversation_checkpoints_stage_copy(chain, 2, k, true);
+            check(along.size() == 1 && along[0].ids == chain[0].ids && !along[0].slot_turn,
+                  "the chain copy leaves the slot turn checkpoint out (each stage's list)");
+            const auto all2 = conversation_checkpoints_stage_copy(chain, 2, k);
+            check(all2.size() == 2 && all2[1].slot_turn, "without the switch it is copied, mark and all");
+        }
+        {
+            const auto along = conversation_checkpoints_stage_copy(chain, 0, 0, true);
+            check(along.size() == 2 && along[0].ids == chain[0].ids && along[1].ids == chain[1].ids,
+                  "no layer split: every checkpoint but the slot turn one");
+        }
+        chain[2].slot_turn = false;
+
         // the deep comparison a verified capture uses: any byte, stamp or mark that differs is seen
         auto ck = chain[2];
         check(conversation_checkpoint_same(ck, chain[2]), "a checkpoint is the same as its copy");
@@ -366,6 +382,8 @@ int main() {
         check(!conversation_checkpoint_same(ck, chain[2]), "the LRU stamp differs");
         ck = chain[2]; ck.pinned = false;
         check(!conversation_checkpoint_same(ck, chain[2]), "the pin differs");
+        ck = chain[2]; ck.slot_turn = true;
+        check(!conversation_checkpoint_same(ck, chain[2]), "the slot turn mark differs");
         SavedConversation a = image({1, 2, 3});
         a.kv.resize(2);
         a.kv[1].k.resize(100, 3);
@@ -462,6 +480,71 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+    }
+    {
+        // STRATA_SUPERSEDE_PREFIX: with STRATA_SLOT_CKPT_MOVE the parked chains hold the shared root only.  The chain
+        // rule drops every conversation sharing that root; the prefix rule keeps them
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        auto fill = [&](ConversationCache& cache) {
+            for (int32_t u = 0; u < 3; ++u) {
+                SavedConversation other = image({1, 2, 3, 4, 100 + u, 101 + u});
+                other.checkpoints = {cp({1, 2, 3, 4})};
+                check(cache.put(std::move(other)), "park a conversation sharing the system prompt");
+            }
+        };
+        SavedConversation outgoing = image({1, 2, 3, 4, 200, 201, 202});
+        outgoing.checkpoints = {cp({1, 2, 3, 4})};
+        ConversationCache chain(1 << 20, 8), prefix(1 << 20, 8);
+        prefix.set_supersede_prefix(true);
+        fill(chain);
+        fill(prefix);
+        SavedConversation o1 = outgoing, o2 = outgoing;
+        check(chain.put(std::move(o1)) && chain.size() == 1 && chain.superseded() == 3,
+              "the chain rule drops every conversation that shares the root (critique A2)");
+        check(prefix.put(std::move(o2)) && prefix.size() == 4 && prefix.superseded() == 0,
+              "the prefix rule keeps them: a root alone supersedes nothing");
+    }
+    {
+        // the prefix rule's drops: this conversation earlier (its live tokens start the outgoing ones), a deeper
+        // checkpoint than the outgoing root that starts them; kept: a branch, a pinned entry, the other steering mode,
+        // another picture
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        ConversationCache cache(1 << 20, 16);
+        cache.set_supersede_prefix(true);
+        SavedConversation stripped = image({1, 2, 3, 4, 10, 99, 98});  // turn t-1, its reply rendered otherwise
+        stripped.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10})};
+        cache.put(std::move(stripped));
+        SavedConversation earlier = image({1, 2, 3, 4, 10, 11});      // turn t-1 with its reply
+        earlier.checkpoints = {cp({1, 2, 3, 4, 10})};                  // ({..10} is its root: `stripped` stays)
+        cache.put(std::move(earlier));
+        SavedConversation branch = image({1, 2, 3, 4, 50, 51});        // another turn after the root
+        branch.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 50})};
+        cache.put(std::move(branch));
+        SavedConversation pinned = image({1, 2, 3, 4, 10});
+        pinned.checkpoints = {cp({1, 2, 3, 4, 10})};
+        pinned.checkpoints[0].pinned = true;
+        cache.put(std::move(pinned));
+        cache.put(image({1, 2, 3, 4, 10, 11}, false));                  // the other steering mode
+        SavedConversation picture = image({1, 2, 3, 4, 10, 11});
+        picture.live.imgs = {{2, 77}};
+        cache.put(std::move(picture));
+        check(cache.size() == 6 && cache.superseded() == 0, "six entries, none superseded yet");
+        // a batch slot's image of turn t: its live tokens include the reply, its chain is the turn checkpoint only
+        SavedConversation slot = image({1, 2, 3, 4, 10, 11, 12, 13, 14});
+        slot.checkpoints = {cp({1, 2, 3, 4, 10, 11, 12})};
+        check(cache.put(std::move(slot)), "park the slot image");
+        // `earlier` goes (its live tokens are a prefix); `stripped` stays: its deepest checkpoint {..10} is not deeper
+        // than the outgoing chain's shallowest, {..12}
+        check(cache.superseded() == 1 && cache.size() == 6, "this conversation a turn back goes (its live tokens start the new ones)");
+        SavedConversation main = image({1, 2, 3, 4, 10, 11, 12, 13, 14, 15});
+        main.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11, 12})};
+        check(cache.put(std::move(main)), "park a main-session image with the root and a deeper checkpoint");
+        // now: the slot image (live a prefix) and `stripped` ({..10} deeper than the root {1..4}, a prefix) go;
+        // `branch` ({..50} not a prefix), `pinned`, the other mode and the picture stay
+        check(cache.superseded() == 3 && cache.size() == 5, "the slot image and the copy with a deeper checkpoint go");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 50, 51, 52}, {}, true).tokens == 6, "the branch stays");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 10, 11, 12}, {}, false).tokens == 6, "the other mode stays");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 10, 11, 12}, {{2, 77}}, true).tokens == 6, "the picture stays");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

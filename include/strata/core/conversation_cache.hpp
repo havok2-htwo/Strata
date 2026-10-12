@@ -29,6 +29,10 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // STRATA_SLOT_PARK: the turn checkpoint a batch slot's conversation was parked with (its own, not one of the chain
+    // it was admitted with).  Once that conversation goes on, the next slot image of it does not carry this one along
+    // (it holds the new turn's).  A run-time mark only, not in the session file.
+    bool slot_turn = false;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
@@ -100,6 +104,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
             part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+            part.slot_turn = c.slot_turn;
             out.parts[k].push_back(std::move(part));
         }
     }
@@ -147,23 +152,32 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
 
 /// What conversation_checkpoints_split(checks, stages) puts in stage `k`'s list (0: `stage0`, k >= 1: `parts[k - 1]`),
 /// COPIED, so `checks` stays as it is: a capture that runs beside the serve loop (STRATA_PARK_ASYNC) reads the chain
-/// while the loop may read it too.  Without a split (stages == 0) every checkpoint as it is.
+/// while the loop may read it too.  Without a split (stages == 0) every checkpoint as it is.  `without_slot_turn`:
+/// the ones marked slot_turn are left out (STRATA_SLOT_PARK: the chain a batch slot's image takes along).
 inline std::vector<ConversationCheckpoint> conversation_checkpoints_stage_copy(
-        const std::vector<ConversationCheckpoint>& checks, size_t stages, size_t k) {
+        const std::vector<ConversationCheckpoint>& checks, size_t stages, size_t k, bool without_slot_turn = false) {
     std::vector<ConversationCheckpoint> out;
     if (stages == 0) {
-        out = checks;
+        if (!without_slot_turn) {
+            out = checks;
+            return out;
+        }
+        size_t n = 0;
+        for (const auto& c : checks) n += c.slot_turn ? 0 : 1;
+        out.reserve(n);
+        for (const auto& c : checks)
+            if (!c.slot_turn) out.push_back(c);
         return out;
     }
     if (k > stages) return out;
     size_t whole = 0;
-    for (const auto& c : checks) whole += c.stage_parts.size() == stages ? 1 : 0;
+    for (const auto& c : checks) whole += c.stage_parts.size() == stages && !(without_slot_turn && c.slot_turn) ? 1 : 0;
     out.reserve(whole);
     for (const auto& c : checks) {
-        if (c.stage_parts.size() != stages) continue;
+        if (c.stage_parts.size() != stages || (without_slot_turn && c.slot_turn)) continue;
         const ConversationCheckpoint& state = k == 0 ? c : c.stage_parts[k - 1];
         ConversationCheckpoint part;
-        part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+        part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned; part.slot_turn = c.slot_turn;
         part.gdn = state.gdn; part.ple = state.ple; part.tails = state.tails; part.dead = state.dead;
         part.block_pos = state.block_pos;
         out.push_back(std::move(part));
@@ -182,6 +196,11 @@ struct SavedConversation {
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    /// The engine runs a drafter, but this image holds no draft-layer K/V: a batch slot's conversation
+    /// (STRATA_SLOT_PARK; slots in pipelined groups draft nothing).  It is validated and restored without the draft
+    /// layer, whose K/V below it then stays as it was - as after a slot's give-back: drafts may differ, tokens never.
+    /// A run-time mark only, not in a session file.
+    bool draftless = false;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -203,6 +222,7 @@ struct SavedConversation {
 inline bool conversation_checkpoint_same(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     if (a.ids != b.ids || a.imgs != b.imgs || a.gdn != b.gdn || a.ple != b.ple || a.tails != b.tails ||
         a.dead != b.dead || a.block_pos != b.block_pos || a.used != b.used || a.pinned != b.pinned ||
+        a.slot_turn != b.slot_turn ||
         a.stage_parts.size() != b.stage_parts.size()) return false;
     for (size_t i = 0; i < a.stage_parts.size(); ++i)
         if (!conversation_checkpoint_same(a.stage_parts[i], b.stage_parts[i])) return false;
@@ -216,7 +236,7 @@ inline bool conversation_kv_same(const ConversationKv& a, const ConversationKv& 
 /// Two parked images alike in every byte (STRATA_PARK_ASYNC_VERIFY: a capture against another of the same state).
 inline bool conversation_image_same(const SavedConversation& a, const SavedConversation& b) {
     if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec ||
-        !conversation_checkpoint_same(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() ||
+        a.draftless != b.draftless || !conversation_checkpoint_same(a.live, b.live) || a.checkpoints.size() != b.checkpoints.size() ||
         a.kv.size() != b.kv.size() || a.stage_images.size() != b.stage_images.size()) return false;
     for (size_t i = 0; i < a.checkpoints.size(); ++i)
         if (!conversation_checkpoint_same(a.checkpoints[i], b.checkpoints[i])) return false;
@@ -367,8 +387,19 @@ public:
     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
+    //
+    // set_supersede_prefix(true) (STRATA_SUPERSEDE_PREFIX, implied by STRATA_SLOT_PARK) decides by tokens instead.
+    // With STRATA_SLOT_CKPT_MOVE a turn checkpoint moves into its batch slot, so a parked chain often holds only the
+    // system prompt's root, and the rule above then drops every other conversation that shares that root; a batch
+    // slot's image (STRATA_SLOT_PARK) holds only its turn checkpoint, so the chain rule never finds its predecessor.
+    // By prefix, an entry that holds no pinned prefix is superseded when its live tokens start the outgoing ones
+    // (this conversation, earlier), or when its deepest checkpoint starts them and is longer than the outgoing chain's
+    // shallowest checkpoint (deeper than any root the two may share).  A root alone never drops an entry.
+    void set_supersede_prefix(bool on) { supersede_prefix_ = on; }
+    bool supersede_prefix() const { return supersede_prefix_; }
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+        if (supersede_prefix_) return drop_superseded_by_prefix(ids, images, checkpoints, cvec);
         auto held = [&](const ConversationCheckpoint& c) {
             if (c.ids == ids && c.imgs == images) return true;
             for (const auto& k : checkpoints)
@@ -393,6 +424,41 @@ public:
         return dropped;
     }
     size_t superseded() const { return superseded_; }
+    size_t drop_superseded_by_prefix(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                                     const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+        // c's tokens, and the pictures among them, start the outgoing conversation
+        auto starts = [&](const ConversationCheckpoint& c) {
+            const size_t n = c.ids.size();
+            if (n == 0 || n > ids.size() || !std::equal(c.ids.begin(), c.ids.end(), ids.begin())) return false;
+            size_t j = 0;
+            for (const auto& image : images) {
+                if (image.start >= (int64_t) n) continue;
+                if (j == c.imgs.size() || !(c.imgs[j++] == image)) return false;
+            }
+            return j == c.imgs.size();
+        };
+        size_t root = 0;   // the outgoing chain's shallowest checkpoint (0: none - then only the live rule applies)
+        for (const auto& k : checkpoints)
+            if (!k.ids.empty() && (root == 0 || k.ids.size() < root)) root = k.ids.size();
+        size_t dropped = 0;
+        for (size_t i = 0; i < entries_.size();) {
+            const auto& e = entries_[i];
+            const ConversationCheckpoint* deepest = nullptr;
+            for (const auto& c : e.checkpoints)
+                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+            const bool earlier = starts(e.live) ||
+                                 (deepest && root > 0 && deepest->ids.size() > root && starts(*deepest));
+            if (e.cvec == cvec && !e.pinned() && earlier) {
+                bytes_ -= e.bytes();
+                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+                ++dropped;
+                continue;
+            }
+            ++i;
+        }
+        superseded_ += dropped;
+        return dropped;
+    }
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
@@ -407,6 +473,7 @@ public:
 private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
+    bool supersede_prefix_ = false;   // drop_superseded by tokens (set_supersede_prefix)
     std::deque<SavedConversation> entries_; // least recently active first
     ConversationKvReuse reuse_;
 };
