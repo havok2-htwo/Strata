@@ -987,6 +987,27 @@ requests' length keeps the long conversation parked. The check runs before `make
 nothing and stores nothing; the log line is `conversation cache: skip parking (N tokens, below the M minimum;
 parked=P)`. 0 is the pre-flag behaviour and the flag leaves the answers untouched - it only decides which
 conversations keep a slot.
+`STRATA_CONV_TIER_DIR=<folder>` (unset: off) adds a disk tier below the RAM cache, an emergency overflow
+(`conversation_tier.hpp`). When the cache evicts a conversation to make room for another (budget or slots), a
+conversation of at least `STRATA_CONV_TIER_MIN_TOKENS` (16384) tokens is written to the folder by a writer thread -
+one session file (format v1, below: O_DIRECT, temporary file, flush, rename) per stage of a layer split, then a small
+meta file as the commit record - and a later request that continues it reads it back (all stages at once) instead of
+reading its prompt again, when the file holds at least `STRATA_CONV_TIER_MIN_GAIN` (2048) more tokens of it than the
+RAM cache, a slot or the live session. Evictions for the RAM floor or a save free their memory at once and are not
+written. A conversation is written once: one that a file holds all but fewer than `STRATA_CONV_TIER_REGROW_TOKENS`
+(8192) tokens of is not written again (its request reads the new tokens on top of the file); grown further, it is
+written in full and its older file goes. Writes stop for the day at `STRATA_CONV_TIER_WRITE_GB_DAY` (200 GB per local
+calendar day, kept in `<folder>/budget`); the folder keeps at most `STRATA_CONV_TIER_CAP_GB` (600) GB and
+`STRATA_CONV_TIER_MAX_FILES` (2000) conversations, least recently used out first, each for
+`STRATA_CONV_TIER_TTL_H` (168) hours after its last use; evicted images wait for the writer in at most
+`STRATA_CONV_TIER_INFLIGHT_MIB` (2048) MiB of RAM, and every write keeps `STRATA_CONV_TIER_MIN_FREE_GB` (64) GiB free.
+Whatever does not fit is dropped as without the tier, and counted. The files are bound to the session identity plus
+the engine binary, its arguments and its `STRATA_*` environment; an earlier run's files are removed at start unless
+`STRATA_CONV_TIER_WARM=1` (then this engine's are used and others are left to their time to live). A restore is the
+evicted image byte for byte; `STRATA_CONV_TIER_VERIFY=1` reads every write back and compares it, and checks every
+restore against a digest of the evicted image. Any failure (I/O, a corrupt or foreign file, RAM) reads the prompt
+instead. The log lines are `conversation tier: <event>; files=F ... budget_left=L spills=S restores=R misses=M
+drops_budget=B ...`; the server reads them into `/metrics`' `conversation_cache.tier`.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
 RAM headroom remain available: the engine checks before allocation (against the
 snapshot's estimated size, less the K/V it already retains) and again after capture.

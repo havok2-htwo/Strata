@@ -24,6 +24,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_tier.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -8325,6 +8326,83 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // STRATA_CONV_TIER_DIR=<folder> (unset: off): the conversation cache's disk tier, an emergency overflow
+        // (conversation_tier.hpp).  A long conversation the RAM cache has to evict to make room for another is written
+        // there (one session file per stage, O_DIRECT, temporary file + rename, a meta file last) by a writer thread,
+        // instead of being dropped; a request that continues it reads it back instead of its prompt.  Only evictions
+        // to make room spill: the RAM floor's and a save's evictions free the memory at once.  A conversation is
+        // written once (one a file holds all but fewer than STRATA_CONV_TIER_REGROW_TOKENS of is not written again;
+        // its request reads the new tokens on top of the file).  The knobs, all optional:
+        //   STRATA_CONV_TIER_MIN_TOKENS (16384)   shorter conversations are dropped as before
+        //   STRATA_CONV_TIER_WRITE_GB_DAY (200)   bytes written per calendar day (kept in <folder>/budget); then dropped
+        //   STRATA_CONV_TIER_CAP_GB (600), _MAX_FILES (2000), _TTL_H (168)   the disk cap and time to live (LRU, last use)
+        //   STRATA_CONV_TIER_INFLIGHT_MIB (2048)  RAM evicted images may hold while they wait for the writer
+        //   STRATA_CONV_TIER_REGROW_TOKENS (8192), STRATA_CONV_TIER_MIN_FREE_GB (64)
+        //   STRATA_CONV_TIER_MIN_GAIN (2048)      a file is read only when it holds this many more tokens than the RAM
+        //                                         cache, a slot or the live session
+        //   STRATA_CONV_TIER_WARM=1               keep and use the files of an earlier run (else they are removed at start)
+        //   STRATA_CONV_TIER_VERIFY=1             every write read back and compared; every restore checked by digest
+        // A file is bound to the session identity plus the engine binary, its arguments and its STRATA_* environment.
+        // An image read back is the image the RAM cache evicted, byte for byte; any failure reads the prompt instead.
+        std::unique_ptr<strata::core::ConversationTier> tier;
+        int64_t tier_min_gain = 2048;
+        if (const char* td = std::getenv("STRATA_CONV_TIER_DIR"); td != nullptr && td[0] != '\0') {
+            auto env_n = [](const char* name, int64_t def) -> int64_t {
+                const char* v = std::getenv(name);
+                if (v == nullptr || v[0] == '\0') return def;
+                char* end = nullptr;
+                const long long x = std::strtoll(v, &end, 10);
+                return end != nullptr && *end == '\0' && x >= 0 ? (int64_t) x : def;
+            };
+            if (!conversations.enabled()) {
+                std::fprintf(stderr, "strata serve: conversation tier: off (STRATA_CONV_TIER_DIR needs the conversation "
+                                     "cache: --conversation-cache-mib)\n");
+            } else {
+                strata::core::ConversationTierConfig tc;
+                tc.dir = td;
+                tc.min_tokens = env_n("STRATA_CONV_TIER_MIN_TOKENS", 16384);
+                tc.budget_bytes = (uint64_t) env_n("STRATA_CONV_TIER_WRITE_GB_DAY", 200) * 1000000000ull;
+                tc.cap_bytes = (uint64_t) env_n("STRATA_CONV_TIER_CAP_GB", 600) * 1000000000ull;
+                tc.max_images = (uint64_t) env_n("STRATA_CONV_TIER_MAX_FILES", 2000);
+                tc.ttl_s = env_n("STRATA_CONV_TIER_TTL_H", 168) * 3600;
+                tc.inflight_bytes = (uint64_t) env_n("STRATA_CONV_TIER_INFLIGHT_MIB", 2048) << 20;
+                tc.regrow_tokens = env_n("STRATA_CONV_TIER_REGROW_TOKENS", 8192);
+                tc.min_free_bytes = (uint64_t) env_n("STRATA_CONV_TIER_MIN_FREE_GB", 64) << 30;
+                tc.warm = env_n("STRATA_CONV_TIER_WARM", 0) != 0;
+                tc.verify = env_n("STRATA_CONV_TIER_VERIFY", 0) != 0;
+                tier_min_gain = env_n("STRATA_CONV_TIER_MIN_GAIN", 2048);
+                tc.thread_start = [] { spread_engine_thread(); };
+                tc.log = [](const std::string& l) {
+                    std::fprintf(stderr, "strata serve: conversation tier: %s\n", l.c_str());
+                };
+                std::string e;
+                strata::core::SessionFileIdentity id;
+                // no announcement callback: nothing waits for these reads (a SAVE's SWAIT lines go to stdout)
+                bool ok = session_identity(id, e, {});
+                uint64_t fp = 0;
+#if defined(__linux__)
+                const std::string exe = "/proc/self/exe";
+#else
+                const std::string exe = argv[0];
+#endif
+                if (ok) ok = strata::core::conversation_tier_fingerprint(id.config, exe,
+                                                                         std::vector<std::string>(argv + 1, argv + argc), fp, e);
+                if (ok) {
+                    id.config = fp;
+                    tc.id = id;
+                    tier = std::make_unique<strata::core::ConversationTier>(std::move(tc));
+                    ok = tier->start(e);
+                }
+                if (!ok) {
+                    std::fprintf(stderr, "strata serve: conversation tier: off (%s)\n", e.c_str());
+                    tier.reset();
+                } else {
+                    conversations.set_evict_sink([&tier](strata::core::SavedConversation&& image, bool spill) {
+                        tier->evicted(std::move(image), spill);
+                    });
+                }
+            }
+        }
         // STRATA_PARK_ASYNC: the capture of the main sessions a request left (park_async_start, after it), on one
         // ParkThreads thread per stage device, that the next request's park decision takes (park_async_take) or stops
         // (park_async_drop).  Declared before the threads: the threads stop first (park_stop), then this goes
@@ -11700,6 +11778,7 @@ int main(int argc, char** argv) {
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
                         const size_t n_parked = conversations.clear();
+                        if (tier) tier->clear();
                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
                                      n_parked == 1 ? "" : "s");
@@ -11954,6 +12033,7 @@ int main(int argc, char** argv) {
                 checks.clear();
                 tail_ckpt_len = -1;
                 const size_t n_parked = conversations.clear();
+                if (tier) tier->clear();   // (STRATA_CONV_TIER_DIR: what it holds may carry the poison too)
                 size_t n_slots = 0, n_running = 0;
                 for (BSlot& sl : bs)
                     if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
@@ -12053,9 +12133,58 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
-            if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            // STRATA_CONV_TIER_DIR: a conversation the RAM cache evicted to disk, when it holds at least
+            // STRATA_CONV_TIER_MIN_GAIN more of this prompt than the RAM cache, a slot or the live session.  It is
+            // read and validated whole before anything is parked or written; any failure reads the prompt instead
+            bool from_tier = false;
+            if (tier && o.prompt_cache > 0) {
+                const auto tm = tier->best(ids, req_imgs, want_cvec);
+                if (tm.tokens > std::max({resume, slot_tokens, parked.tokens}) + tier_min_gain) {
+                    std::string why;
+                    bool ok = tm.parts == stages.size() + 1;
+                    if (!ok) why = "stage count";
+                    std::vector<strata::core::SessionReadLimits> lim(tm.parts);
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                    for (size_t k = 0; k < tm.parts && ok; ++k) {
+                        lim[k].admit = [floor, &o](uint64_t need, std::string& w) {
+                            const auto mem = strata::core::sample_host_memory();
+                            if (strata::core::conversation_memory_admit(
+                                    mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor)) return true;
+                            w = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                                std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB, " + ram_note(mem) + ")";
+                            return false;
+                        };
+                        // the draft layer's K/V: the last stage's, unless the image holds none (a batch slot's)
+                        const bool draft = use_mtp && !tm.draftless && k == stages.size();
+                        ok = strata::core::conversation_session_read_limits(lim[k], k == 0 ? ss : stages[k - 1]->ss, g,
+                                draft ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
+                                (uint64_t) std::max(o.prompt_cache, 1) + 64, why);
+                    }
+                    strata::core::SavedConversation img;
+                    if (ok) ok = tier->load(tm.key, lim, img, why);
+                    for (size_t i = 0; ok && i < stages.size(); ++i) {
+                        const strata::core::OnDevice on(stages[i]->dev);
+                        ok = strata::core::conversation_snapshot_validate(img.stage_images[i], stages[i]->ss, g,
+                                use_mtp && !img.draftless && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, why);
+                        if (!ok) tier->reject(tm.key, why);
+                    }
+                    if (ok && !(ok = strata::core::conversation_snapshot_validate(img, ss, g,
+                            use_mtp && !img.draftless && stages.empty() ? &mtp.kv_state() : nullptr, why)))
+                        tier->reject(tm.key, why);
+                    if (ok) {
+                        incoming.emplace(std::move(img));
+                        parked.tokens = tm.tokens;
+                        parked.live = tm.live;
+                        from_tier = true;
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation tier: %lld tokens not restored (%s); reading the "
+                                             "prompt instead\n", (long long) tm.tokens, why.c_str());
+                    }
+                }
+            }
+            if (!from_tier && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -12237,10 +12366,10 @@ int main(int argc, char** argv) {
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 lent_slot = -1;   // (the main session holds the parked conversation now)
-                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
+                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu%s\n",
                              (long long) resume, from_live ? "live" : "checkpoint",
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes());
+                             conversations.size(), conversations.bytes(), from_tier ? " from=disk" : "");
             }
             if (want_cvec != cvec_cached) {
                 live_ok = false;

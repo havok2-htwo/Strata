@@ -76,6 +76,11 @@ bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, i
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
+// The same for a session without the draft layer's K/V (draft == nullptr): a layer split's earlier stages, and an image
+// that holds none (a batch slot's).
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error);
 
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;

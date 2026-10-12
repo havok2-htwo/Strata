@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -347,7 +348,7 @@ public:
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
-            if (!evict_oldest()) return false;
+            if (!evict_oldest(true)) return false;
         }
         return true;
     }
@@ -358,14 +359,26 @@ public:
     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
-    bool evict_oldest() {
+    // `spill` (make_room's evictions: the cache made room for another image): an eviction sink may keep the image
+    // (STRATA_CONV_TIER_DIR, conversation_tier.hpp).  The physical-RAM gate and a save's reclaim evict to get the memory
+    // back, so their victims are freed here at once - the sink only hears of them.
+    bool evict_oldest(bool spill = false) {
         auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
         if (victim == entries_.end()) return false;
         bytes_ -= victim->bytes();
-        entries_.erase(victim);
         ++evictions_;
-        return true;
+        if (!evict_sink_) {
+            entries_.erase(victim);
+            return true;
+        }
+        SavedConversation image = std::move(*victim);
+        entries_.erase(victim);
+        evict_sink_(std::move(image), spill);
+        return true;   // (whatever the sink left of `image` is freed here)
     }
+    /// Where evicted images go (none: freed).  Never drop_superseded's or clear()'s: those are not wanted any more.
+    using EvictSink = std::function<void(SavedConversation&&, bool spill)>;
+    void set_evict_sink(EvictSink sink) { evict_sink_ = std::move(sink); }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
     // may carry the poison.  Returns how many were parked.
@@ -474,6 +487,7 @@ private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     bool supersede_prefix_ = false;   // drop_superseded by tokens (set_supersede_prefix)
+    EvictSink evict_sink_;            // set_evict_sink
     std::deque<SavedConversation> entries_; // least recently active first
     ConversationKvReuse reuse_;
 };
