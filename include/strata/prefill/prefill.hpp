@@ -228,6 +228,10 @@ private:
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
+    /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
+    const void* hand_ev_ = nullptr;
+    int hand_pieces_ = 0;
 
     std::string next_err_;
     std::future<bool> next_run_;
