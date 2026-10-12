@@ -222,6 +222,29 @@ class ConversationCacheCard(unittest.TestCase):
             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
             self.assertEqual(c.poll(None, None)["parked"], 0)
 
+    TIER = ("strata serve: conversation tier: spilled 20000 tokens (620.0 MB, 5 files) in 210.0 ms; files=1 parts=4 "
+            "disk_bytes=620000000 written_today=620000000 budget=200000000000 budget_left=199380000000 spills=1 "
+            "written_bytes=620000000 restores=0 restores_queue=0 read_bytes=0 misses=0 drops_small=0 drops_budget=0 "
+            "drops_busy=0 drops_ram=0 drops_cap=0 drops_io=0 kept=0 superseded=0 expired=0 evicted=0 pending=0 "
+            "pending_bytes=0 foreign=0 verified=0\n")
+
+    def test_the_tier_log(self):
+        from serve.server import ConvCacheLog
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata.log"
+            log.write_text(self.PARK, encoding="utf-8")
+            c = ConvCacheLog()
+            self.assertNotIn("tier", c.poll(str(log), 0))   # no tier line: no "tier" entry
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(self.TIER + self.TIER.replace("spills=1", "spills=1").replace("restores=0 ", "restores=1 ", 1)
+                        .replace("spilled 20000 tokens (620.0 MB, 5 files) in 210.0 ms", "restored 20000 tokens from disk"))
+            t = c.poll(str(log), 0)["tier"]
+            self.assertEqual((t["files"], t["disk_bytes"], t["spills"], t["restores"], t["budget_left"]),
+                             (1, 620000000, 1, 1, 199380000000))
+            self.assertEqual(t["last_event"], "restored 20000 tokens from disk")
+            self.assertEqual(c.poll(str(log), 0)["parks"], 1)   # the cache's own lines are read as before
+
     def test_metrics(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)

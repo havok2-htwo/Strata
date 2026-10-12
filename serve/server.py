@@ -508,6 +508,10 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # STRATA_CONV_TIER_DIR (the disk tier): "conversation tier: <event>; files=F parts=P disk_bytes=D written_today=W
+    # budget=B budget_left=L spills=S ... restores=R misses=M drops_budget=X ..." - every counter after the event
+    TIER = re.compile(r"conversation tier: (.*?); (files=\d+.*)$")
+    TIER_FIELD = re.compile(r"(\w+)=(\d+)")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -540,6 +544,13 @@ class ConvCacheLog:
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
+            if "conversation tier:" in line:              # (only with the tier on: "tier" is absent otherwise)
+                m = self.TIER.search(line)
+                if m:
+                    tier = {k: int(v) for k, v in self.TIER_FIELD.findall(m.group(2))}
+                    tier["last_event"], tier["last_at"] = m.group(1), now
+                    self.state["tier"] = tier
+                continue
             if "conversation cache:" not in line:
                 continue
             m = self.EVENT.search(line)
