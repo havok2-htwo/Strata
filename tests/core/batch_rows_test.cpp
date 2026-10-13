@@ -72,6 +72,27 @@ int main() {
         check(run(rows, pos, 3, 1, 8, -1, false) != nullptr, "a negative hand-off base");
         check(run(rows, pos, 3, 1, 8, 0, false) == nullptr, "three rows of one slot are a group");
     }
+    // the rope rows of a window (--vision with --batch): every head group of row t at its slot's base + cell; the
+    // other rows untouched; base 0 stages the cell itself (text byte-identity without the slot regions)
+    {
+        const int max_t = 8;
+        const int64_t nh = 3, nkv = 2, iq = 4;
+        int32_t h_pos[max_t * (3 + 2 + 4)];
+        for (int32_t& v : h_pos) v = -7;
+        strata::core::batch_rows_stage_rope(h_pos, max_t, nh, nkv, iq, 2, 100, 0);
+        strata::core::batch_rows_stage_rope(h_pos, max_t, nh, nkv, iq, 5, 100, 262208);
+        const int32_t* q = h_pos;
+        const int32_t* k = h_pos + max_t * nh;
+        const int32_t* x = k + max_t * nkv;
+        bool ok = true;
+        for (int64_t h = 0; h < nh; ++h) ok = ok && q[2 * nh + h] == 100 && q[5 * nh + h] == 262308;
+        for (int64_t h = 0; h < nkv; ++h) ok = ok && k[2 * nkv + h] == 100 && k[5 * nkv + h] == 262308;
+        for (int64_t h = 0; h < iq; ++h) ok = ok && x[2 * iq + h] == 100 && x[5 * iq + h] == 262308;
+        check(ok, "every head group of a row at base + cell (base 0: the cell)");
+        int untouched = 0;
+        for (int32_t v : h_pos) untouched += v == -7;
+        check(untouched == max_t * (3 + 2 + 4) - 2 * (3 + 2 + 4), "the other rows are not written");
+    }
     if (failures != 0) return EXIT_FAILURE;
     std::printf("batch_rows_test: ok\n");
     return EXIT_SUCCESS;

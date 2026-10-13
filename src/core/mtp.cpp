@@ -246,6 +246,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
     g_ = &g;
     ss_ = &ss;
+    rope_base_ = ss.mrope_base;   // a batch slot's drafter rotates in the slot's region of the M-RoPE table
     if (ple_ss_ == nullptr) ple_ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
@@ -1219,7 +1220,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             stp[i * 4 + 1] = (int32_t) (cell + 1);
             stp[i * 4 + 2] = (int32_t) ((cell + 1) / 4);
             stp[i * 4 + 3] = (int32_t) (cell + 1);
-            for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) cell;
+            for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) (rope_base_ + cell);
         }
         if (cudaMemcpyAsync(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
             err = "mtp prefill: the input records upload failed";
@@ -1265,7 +1266,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             h_step_[t * 4 + 1] = (int32_t) (cell + 1);
             h_step_[t * 4 + 2] = (int32_t) ((cell + 1) / 4);
             h_step_[t * 4 + 3] = (int32_t) (cell + 1);
-            for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[t * g_->n_head + h] = (int32_t) cell;
+            for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[t * g_->n_head + h] = (int32_t) (rope_base_ + cell);
         }
         if (cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
                             cs_) != cudaSuccess ||
@@ -1301,7 +1302,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         h_step_[row * 4 + 1] = (int32_t) (cell + 1);
         h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) (rope_base_ + cell);
     };
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
@@ -1460,7 +1461,7 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
         h_step_[row * 4 + 1] = (int32_t) (cell + 1);
         h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) (rope_base_ + cell);
     };
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];

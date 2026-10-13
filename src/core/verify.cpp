@@ -1352,9 +1352,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
                         const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                        native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                                  (const float*) wikn->data, EPS, ib, s, sx.max_cells,
-                                                  rope_scaling(), cs);
+                        // the pooled key rotates at pos_base + 4b: a batch row's slot region (its mrope_base, a
+                        // constant of the captured layout), the main session's 0
+                        native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos,
+                                                  slot_ss(t).mrope_base, (const float*) wikn->data, EPS, ib, s,
+                                                  sx.max_cells, rope_scaling(), cs);
                     }
                 }
                 stamp(l, 9, grp);
@@ -2740,10 +2742,12 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS,
                                      TS, cs_);
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                    // (the re-append rotates in the slot's own region of the M-RoPE table, as the window did)
+                    const int32_t rbase = slots_[(size_t) rows[first]]->mrope_base;
                     for (int u = first; u < t; ++u)
                         native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
-                                                  0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                  rbase, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_);
                 }
                 ++qsa_index;
@@ -2865,11 +2869,10 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     for (int t = 0; t < S; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
-        int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
-        int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
+        // the rope rows read the slot's own region of the M-RoPE table (--vision: base + cell; 0 + cell otherwise);
+        // the step above keeps the cell
+        batch_rows_stage_rope(h_pos_, max_t_, g.n_head, g.n_head_kv, g.idx_q_heads, t, pos[t],
+                              slots_[(size_t) rows[t]]->mrope_base);
     }
     if (ss_->ple.ready() && ple_stage()) {
         uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)

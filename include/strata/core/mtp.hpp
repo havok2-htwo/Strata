@@ -257,6 +257,9 @@ private:
     int32_t *h_tok_ = nullptr, *m_tok_ = nullptr, *h_step_ = nullptr, *m_step_ = nullptr;
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
+    // --vision with --batch: the M-RoPE table row of cell 0 for this drafter's rows (the session it was loaded with:
+    // a batch slot's region, 0 for the main drafter).  h_pos_ holds rope_base_ + cell, h_step_ keeps the cell.
+    int32_t rope_base_ = 0;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;

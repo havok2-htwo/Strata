@@ -3873,8 +3873,13 @@ int main(int argc, char **argv) try {
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
+        // --vision: this port keeps one M-RoPE table per device, which every batch row reads at its own cell, and
+        // has no per-slot regions (the CUDA engine's strata/program/mrope_regions.hpp): an image slot would give its
+        // positions to the text slots and take theirs.  So --vision runs without batch slots here.
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
-                        : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
+                        : split_same ? "it needs each stage of a layer split on its own GPU"
+                        : o.vision ? "it does not run with --vision on this backend (image and text slots would share "
+                                     "one M-RoPE table)" : nullptr;
         if (off != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch %d is off: %s\n", o.batch, off);
             o.batch = 0;

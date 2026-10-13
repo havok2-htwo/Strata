@@ -1,11 +1,12 @@
-"""--batch ("parallel"): a request with an image has the engine alone.
+"""--batch ("parallel"): a request with an image has the engine alone - unless the engine keeps one M-RoPE table per slot.
 
-The engine's M-RoPE position table (an image's positions) is one per GPU and is rebuilt at every admission, while each
-batch row reads it at its own slot's position: an image decoding next to other slots gave them its positions and took
-theirs (silently wrong text).  Until the engine keeps one per slot, the server runs an image request on the solo path
-(GENI) with no other slot active for its whole run: from its arrival no new request is admitted, the slots that decode
-finish, then it runs; image requests queue one after another; a cancelled or failed one gives the turn back.  Also: a
-dead image encoder fails only requests with images.
+An engine without per-slot tables keeps one M-RoPE position table (an image's positions) per GPU, rebuilt at every
+admission, while each batch row reads it at its own slot's position: an image decoding next to other slots gave them
+its positions and took theirs (silently wrong text).  With such an engine the server runs an image request on the solo
+path (GENI) with no other slot active for its whole run: from its arrival no new request is admitted, the slots that
+decode finish, then it runs; image requests queue one after another; a cancelled or failed one gives the turn back.
+An engine that says INFO mrope_slots=1 keeps a table region per slot: its image requests go through the batch like any
+other (BGENI beside the text slots).  Also: a dead image encoder fails only requests with images.
 
 The admission logic is tested on an engine object without a process; the whole path over HTTP with the fake engine
 of test_parallel (taught GENI, and to log the lines it receives).
@@ -40,6 +41,9 @@ for old, new in (
          '        with evl:\n'
          '            evf.write(s + "\\n"); evf.flush()\n'),
         ('        l = l.strip()\n', '        l = l.strip()\n        note("RECV " + l.split(" ", 1)[0])\n'),
+        # --mrope-slots: the engine keeps one M-RoPE table region per slot and says so
+        ('(" slot_cache=1" if "--slotcache" in args else "")',
+         '(" slot_cache=1" if "--slotcache" in args else "") + (" mrope_slots=1" if "--mrope-slots" in args else "")'),
         ('if line.startswith(("GEN ", "BGEN ")):', 'if line.startswith(("GEN ", "BGEN ", "GENI ", "BGENI ")):'),
         ('slot = int(f[1]) if f[0] == "BGEN" else None', 'slot = int(f[1]) if f[0] in ("BGEN", "BGENI") else None'),
         ('max_new = int(f[2] if f[0] == "BGEN" else f[1])', 'max_new = int(f[2] if f[0] in ("BGEN", "BGENI") else f[1])'),
@@ -293,6 +297,13 @@ class Admission(unittest.TestCase):
         self.assertEqual(e.slot_busy, [False, False])
         e.ctl.release()
 
+    def test_the_handshake_decides_whether_an_image_runs_alone(self):
+        e = engine_without_process()
+        for info, alone in (({}, True), (None, True), ({"mrope_slots": 0}, True), ({"slot_cache": 1}, True),
+                            ({"mrope_slots": 1}, False), ({"mrope_slots": 1, "batch_slots": 4}, False)):
+            e.info = info
+            self.assertEqual(e.image_alone(), alone, info)
+
     def test_no_slot_goes_back_to_the_solo_path_while_an_image_waits(self):
         e = engine_without_process()
         e.info = {"slot_cache": 1}
@@ -336,8 +347,8 @@ class OverHttp(unittest.TestCase):
     start_engine, tearDown = test_parallel.ParallelService.start, test_parallel.ParallelService.tearDown
     chat = test_parallel.ParallelService.chat
 
-    def start(self, vision=LiveVision, slots=2):
-        self.start_engine(slots)
+    def start(self, vision=LiveVision, slots=2, mrope=False):
+        self.start_engine(slots, more=["--mrope-slots"] if mrope else [])
         script = Path(self.tmp.name) / "fake_strata.py"
         script.write_text(FAKE, encoding="utf-8")
         self.events = Path(self.tmp.name) / "events.log"
@@ -414,6 +425,72 @@ class OverHttp(unittest.TestCase):
         e = self.engine
         self.assertEqual((e.image_line, e.waiting, e.wait_lens, any(e.slot_busy), e.ctl.locked()),
                          ([], 0, [], False, False))
+        self.assertNotIn("mrope_slots", e.info)             # (an engine without per-slot tables)
+
+    def test_with_slot_tables_an_image_shares_the_batch(self):
+        """INFO mrope_slots=1: the image request is admitted into a slot (BGENI) while the text slots decode, and a text
+        request that comes after it is admitted while the image slot decodes; nothing waits for the engine alone."""
+        self.start(slots=4, mrope=True)
+        self.assertEqual(self.engine.info.get("mrope_slots"), 1)
+        out, errors = {}, []
+        threads = [self.go(self.chat, "first LONGREPLY", out, errors)]
+        time.sleep(0.1)
+        threads.append(self.go(self.chat, "second LONGREPLY", out, errors))
+        self.assertTrue(until(lambda: sum(self.engine.slot_busy) == 2))   # both decode in the slots
+        threads.append(self.go(self.image_chat, "the picture LONGREPLY", out, errors))
+        self.assertTrue(until(lambda: sum(self.engine.slot_busy) == 3))   # the image in a slot beside them
+        self.assertEqual(self.engine.image_line, [])
+        threads.append(self.go(self.chat, "late LONGREPLY", out, errors))
+        for th in threads:
+            th.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(out, {"first LONGREPLY": LONG_REPLY, "second LONGREPLY": LONG_REPLY,
+                               "the picture LONGREPLY": LONG_REPLY, "late LONGREPLY": LONG_REPLY})
+        ev = self.recv()
+        self.assertNotIn("GENI", ev)                        # never the solo path alone
+        self.assertEqual(ev.count("BGENI"), 1, ev)
+        # the fake logged how many slots were active at each admission: the image came beside both text slots, and
+        # the late text request beside the image slot
+        adm = [x.split() for x in self.log.read_text().splitlines() if x.startswith(("BGEN", "BGENI"))]
+        kinds = [a[0] for a in adm]
+        i = kinds.index("BGENI")
+        self.assertGreaterEqual(int(adm[i][3]), 2, adm)
+        self.assertTrue([a for a in adm[i + 1:] if a[0] == "BGEN" and int(a[3]) >= 1], adm)
+        e = self.engine
+        self.assertTrue(until(lambda: not any(e.slot_busy)))
+        self.assertEqual((e.image_line, e.waiting, e.wait_lens, e.ctl.locked()), ([], 0, [], False))
+
+    def test_with_slot_tables_an_image_alone_takes_the_solo_path(self):
+        """INFO mrope_slots=1 and nothing else running: the image runs on the solo path (GENI), as a text request
+        would, and a text request that comes meanwhile does not wait for it to end."""
+        self.start(slots=3, mrope=True)
+        out, errors = {}, []
+        threads = [self.go(self.image_chat, "the picture LONGREPLY", out, errors)]
+        time.sleep(0.15)
+        threads.append(self.go(self.chat, "text LONGREPLY", out, errors))
+        for th in threads:
+            th.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(set(out.values()), {LONG_REPLY})
+        ev = self.recv()
+        self.assertEqual(ev[:1], ["GENI"], ev)
+        # the text request arriving STOPped the image's solo run, which went on in a slot (BGENI with the reply so
+        # far), and the text request was admitted beside it (one slot active at its BGEN)
+        self.assertIn("BGENI", ev)
+        adm = [x.split() for x in self.log.read_text().splitlines() if x.startswith("BGEN ")]
+        self.assertTrue(adm and int(adm[0][3]) >= 1, adm)
+        self.assertEqual(self.engine.image_line, [])
+
+    def test_a_restarted_engine_says_its_slot_tables_again(self):
+        """mrope_slots is the running engine's: a restart into an engine that does not say it (its tables did not fit)
+        sends image requests alone again."""
+        self.start(slots=2, mrope=True)
+        self.assertEqual(self.engine.image_alone(), False)
+        exe, args, *rest = self.engine.spawn
+        self.engine.spawn = (exe, [a for a in args if a != "--mrope-slots"], *rest)
+        self.engine.restart()
+        self.assertNotIn("mrope_slots", self.engine.info)
+        self.assertEqual(self.engine.image_alone(), True)
 
     def test_images_queue_one_after_another(self):
         self.start()

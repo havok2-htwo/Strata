@@ -30,6 +30,11 @@ namespace strata::core {
 /// handoff between the GPU and the CPU expert pool.
 struct SessionState {
     int64_t max_cells = 0;
+    /// --vision with --batch: the M-RoPE table row of this session's cell 0 (strata/kernels/mrope.hpp).  A batch
+    /// slot's rows pass mrope_base + cell as their rope position, which reads the slot's own region of the table; the
+    /// cell itself (KV write, attention length, QSA step) is unchanged.  0 for the main sessions and whenever there is
+    /// no table (without --vision the position a kernel gets is the rotary position itself, so it must stay 0).
+    int32_t mrope_base = 0;
 
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
     float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)

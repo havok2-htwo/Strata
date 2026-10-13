@@ -269,6 +269,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)
   add_test(NAME batch_read_test COMMAND batch_read_test)
+  # --vision with --batch: the M-RoPE table's slot regions, their bases and when an admission copies the main region
+  # into a slot's, with a host model of the table as the rope kernels read it (header-only, CPU)
+  add_executable(mrope_regions_test tests/program/mrope_regions_test.cpp)
+  target_include_directories(mrope_regions_test PRIVATE include)
+  add_test(NAME mrope_regions_test COMMAND mrope_regions_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)

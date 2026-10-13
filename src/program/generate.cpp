@@ -77,6 +77,7 @@
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/program/batch_groups.hpp"
+#include "strata/program/mrope_regions.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -189,6 +190,16 @@ bool admit_merge_first_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_ADMIT_MERGE_FIRST");
         return v && v[0] != '0';
+    }();
+    return on;
+}
+// STRATA_MROPE_REGION_SKIP=1 (read once; a test's negative control, never for use): a batch admission does not copy the
+// main region of the M-RoPE table into its slot's, so an image slot decodes at the identity positions (wrong text).
+// tools/vision_batch_check.py --negative-control sets it to show that its comparisons catch a missing copy
+bool mrope_region_skip_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MROPE_REGION_SKIP");
+        return v && v[0] != '\0' && v[0] != '0';
     }();
     return on;
 }
@@ -4904,6 +4915,74 @@ int main(int argc, char** argv) {
                          (double) bytes0 * o.batch / 1073741824.0);
         }
     }
+    // --vision with --batch: the M-RoPE table grows from one region to 1 + B, region 1 + b being batch slot b's
+    // (strata/program/mrope_regions.hpp), and each slot session's rows read their own region (mrope_base).  B is the
+    // slots that run, after every clamp above.  Before any CUDA graph is captured (the kernels take the table pointer
+    // as an argument; nothing has captured one yet), so the new allocation simply replaces the one-region table.
+    // When it does not fit, the slots keep base 0 and the engine keeps refusing image and text rows side by side.
+    int mrope_slot_n = 0;                                  // the slot regions in use (INFO mrope_slots)
+    int64_t mrope_stride = 0;
+    if (const int want = strata::program::mrope_regions::slot_regions(o.vision && d_mrope != nullptr, o.serve, o.batch);
+        want > 0 && (int) bslot_ss.size() == 1 + (int) stages.size()) {
+        namespace mr = strata::program::mrope_regions;
+        mrope_stride = mr::stride(o.max_context);
+        const int64_t entries = mr::table_entries(want, mrope_stride);
+        const std::vector<int32_t> ident = mr::identity(mrope_stride);
+        const size_t region_bytes = ident.size() * sizeof(int32_t);
+        // every device's new table first; the old ones are replaced only once all of them exist
+        std::vector<int32_t*> grown(1 + stages.size(), nullptr);
+        bool ok = entries > 0;
+        for (size_t k = 0; k < grown.size() && ok; ++k) {
+            const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+            ok = cudaMalloc(&grown[k], (size_t) entries * sizeof(int32_t)) == cudaSuccess;
+            for (int r = 0; r <= want && ok; ++r)
+                ok = cudaMemcpy(grown[k] + (size_t) r * ident.size(), ident.data(), region_bytes,
+                                cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        if (!ok) {
+            cudaGetLastError();
+            for (size_t k = 0; k < grown.size(); ++k)
+                if (grown[k] != nullptr) {
+                    const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                    cudaFree(grown[k]);
+                }
+            std::fprintf(stderr, "strata generate: WARNING: --vision with --batch %d: the per-slot image position "
+                                 "tables (%.1f MiB per GPU) do not fit; an image request waits for the slots to be "
+                                 "idle (ERR vision: ...)\n", o.batch,
+                         (double) entries * sizeof(int32_t) / 1048576.0);
+        } else {
+            for (size_t k = 0; k < grown.size(); ++k) {
+                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                cudaDeviceSynchronize();
+                int32_t*& tab = k == 0 ? d_mrope : stages[k - 1]->mrope;
+                cudaFree(tab);
+                tab = grown[k];
+                strata::kernels::mrope_table_set(tab);
+            }
+            mrope_slot_n = want;
+            for (auto& per_stage : bslot_ss)
+                for (int b = 0; b < (int) per_stage.size(); ++b)
+                    per_stage[(size_t) b]->mrope_base = mr::slot_base(b, mrope_stride);
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            std::fprintf(stderr, "strata generate: --vision with --batch %d: the image position table holds %d regions "
+                                 "of %lld rows (the main sessions' and one per slot), %.1f MiB per GPU; image and text "
+                                 "requests share the batch\n", o.batch, 1 + want, (long long) mrope_stride,
+                         (double) entries * sizeof(int32_t) / 1048576.0);
+            if (mrope_region_skip_env())
+                std::fprintf(stderr, "strata generate: WARNING: STRATA_MROPE_REGION_SKIP=1 (a test's negative control): "
+                                     "image slots decode at the wrong positions\n");
+        }
+    }
+    // without the slot regions every session reads region 0 (or, without --vision, no table at all): a base other than
+    // 0 would rotate those rows by the wrong angle
+    for (const auto& per_stage : bslot_ss)
+        for (const auto& u : per_stage)
+            if (mrope_slot_n == 0 && u->mrope_base != 0) {
+                std::fprintf(stderr, "strata generate: internal error: a slot session has an M-RoPE base without the "
+                                     "slot regions\n");
+                return 1;
+            }
 
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
@@ -9803,7 +9882,8 @@ int main(int argc, char** argv) {
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups) +
+                                       (mrope_slot_n > 0 ? " mrope_slots=1" : "")).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -10032,6 +10112,9 @@ int main(int argc, char** argv) {
             std::vector<ConvCheckpoint> chain;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        // --vision with --batch (mrope_slot_n > 0): slot b's region of the M-RoPE table holds an image layout (it is not
+        // the identity).  Kept apart from BSlot, which an admission resets: this describes the table, not the request.
+        std::vector<char> slot_mrope_img(bs.size(), 0);
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -10067,7 +10150,19 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+        // --vision with --batch: queue the copy of the main region of device k's M-RoPE table (the admitted request's
+        // positions, the decode tail included: the whole region) into slot b's region, on the device's default stream.
+        // The callers synchronise the device after it (each device's last cudaDeviceSynchronize, or sync_all), so it
+        // is done before the slot's first window or draft, which run on non-blocking streams.
+        auto queue_slot_region = [&](size_t k, int b) -> bool {
+            int32_t* tab = k == 0 ? d_mrope : stages[k - 1]->mrope;
+            const size_t rows = (size_t) mrope_stride;
+            return tab != nullptr &&
+                   cudaMemcpyAsync(tab + (size_t) strata::program::mrope_regions::slot_base(b, mrope_stride) * 3, tab,
+                                   rows * 3 * sizeof(int32_t), cudaMemcpyDeviceToDevice, 0) == cudaSuccess;
+        };
+        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e,
+                                    bool region = false) -> bool {
             const int64_t upto = (int64_t) ids.size();
             auto sync_all = [&]() {
                 bool ok = true;
@@ -10094,14 +10189,21 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
                                                             to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
                         return failed();
+                if (region && !queue_slot_region(k, b)) { e = "batch slot copy: the image positions failed"; return failed(); }
             }
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
+            // --vision with --batch: the slot's region of the M-RoPE table becomes the main region (this request's
+            // positions) when either holds an image layout; text after text copies nothing.  Until the copy is done
+            // the region's contents are unknown (a failed copy leaves it marked, so the next admission copies again).
+            const bool region = mrope_slot_n > 0 && !mrope_region_skip_env() &&
+                                strata::program::mrope_regions::copy_needed(mrope_identity, slot_mrope_img[(size_t) b] != 0);
+            if (region) slot_mrope_img[(size_t) b] = 1;
             if (slot_copy_direct) {
-                if (!direct_slot_copy(true, b, ids, e)) return false;
+                if (!direct_slot_copy(true, b, ids, e, region)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
@@ -10121,8 +10223,12 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
+                if (region && !queue_slot_region(k, b)) { e = "batch admission: the image positions failed"; return false; }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
+            // every device's region copy is done (synchronised above); the slot's drafter reads the table of its own
+            // device, which is one of them (the last stage's, or CUDA0's)
+            if (region) slot_mrope_img[(size_t) b] = mrope_identity ? 0 : 1;
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
                 // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
@@ -11877,12 +11983,14 @@ int main(int argc, char** argv) {
             const int64_t n = (int64_t) ids.size();
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
-            // --vision with --batch: the M-RoPE table below is one per device, indexed by a cell's position, and every
+            // --vision with --batch, without the slot regions (they did not fit: mrope_slot_n == 0, no INFO
+            // mrope_slots): the M-RoPE table below is one region per device, indexed by a cell's position, and every
             // batch row reads it at its slot's own position.  An image request's table is not the identity a text
             // slot needs (nor another image slot's), so image and text rows never decode together: a GENI / BGENI
             // only while no slot decodes, a GEN / BGEN not while a slot that was admitted with pictures decodes.
-            // (Before the table is touched; text-only traffic never meets either refusal.)
-            if (o.vision && !bs.empty()) {
+            // (Before the table is touched; text-only traffic never meets either refusal.)  With the slot regions each
+            // slot reads its own region (copy_to_slot fills it) and neither refusal applies.
+            if (o.vision && !bs.empty() && mrope_slot_n == 0) {
                 int busy = -1, busy_img = -1;
                 for (size_t b = 0; b < bs.size(); ++b) {
                     if (!bs[b].active) continue;
@@ -14612,6 +14720,12 @@ int main(int argc, char** argv) {
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
+                    // (--vision with --batch: this also keeps the slot's M-RoPE region with its state.  A slot's
+                    // sessions are only written by copy_to_slot, from the main sessions, right after the request that
+                    // decodes there was parsed and region 0 rebuilt for its cells; an image slot is never cached, has
+                    // no checkpoints, is not parked and gives way to nobody (BYIELD is text only), so its state never
+                    // moves to the main sessions or another slot, where it would read another region.  A later turn
+                    // of its conversation sends its pictures again (BGENI) and is laid out anew.)
                     // STRATA_SLOT_PARK: the slot parks this conversation (with its reply), not the main sessions
                     sl.parks = slot_park_on && !sl.img;
                     if (sl.parks) main_slot = admit_slot;

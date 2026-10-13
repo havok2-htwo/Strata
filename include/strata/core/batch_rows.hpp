@@ -6,6 +6,7 @@
 // stage sees the same layout).  The rows travel between the stages of a layer split in hand-off buffers of
 // `handoff_rows` rows, the window's group starting at row `hbase`.
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::core {
@@ -25,6 +26,20 @@ inline const char* batch_rows_error(const int* rows, int S, const int64_t* pos, 
             return "verify: proposed rows must have consecutive positions";
     }
     return nullptr;
+}
+
+/// Row t's rope positions in the verifier's staging, [max_t][n_head] q rows, then [max_t][n_head_kv] K rows, then
+/// [max_t][idx_q_heads] indexer-query rows: every head of every group at `mrope_base + cell` (--vision with --batch:
+/// the slot's region of the M-RoPE table; base 0 otherwise, the cell itself).  The KV cell, the attention length and
+/// the QSA step are staged apart (qsa_step_fill) and keep the cell.
+inline void batch_rows_stage_rope(int32_t* h_pos, int max_t, int64_t n_head, int64_t n_head_kv, int64_t idx_q_heads,
+                                  int t, int64_t cell, int32_t mrope_base) {
+    const int32_t rp = (int32_t) (mrope_base + cell);
+    for (int64_t h = 0; h < n_head; ++h) h_pos[t * n_head + h] = rp;
+    int32_t* pk = h_pos + (size_t) max_t * n_head;
+    int32_t* pi = pk + (size_t) max_t * n_head_kv;
+    for (int64_t h = 0; h < n_head_kv; ++h) pk[t * n_head_kv + h] = rp;
+    for (int64_t h = 0; h < idx_q_heads; ++h) pi[t * idx_q_heads + h] = rp;
 }
 
 }  // namespace strata::core

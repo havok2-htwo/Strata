@@ -7,11 +7,15 @@
 // p + max(nx, ny), not at its cell index.
 //
 // The table: nullptr (the default) keeps every kernel exactly as before - the position a caller passes is the
-// rotary position.  Set, it is a DEVICE int32 [cells][3] (t, h, w) and the position a caller passes is read as a
-// CELL index; pair i rotates by tab[cell * 3 + mrope_sector(i)].  Every caller in the engine passes cell indices
-// (pos_base is 0 everywhere), so the table covers the prompt path, the verify window and the MTP drafter at once.
-// The pointer must be set before any CUDA graph is captured (kernels take it as an argument); the contents may
-// change between requests.
+// rotary position.  Set, it is a DEVICE int32 [rows][3] (t, h, w) and the position a caller passes is read as a
+// table ROW; pair i rotates by tab[row * 3 + mrope_sector(i)].  The main sessions pass their cell indices (base 0),
+// so the table covers the prompt path, the verify window and the MTP drafter at once.  With --batch the table holds
+// one region per batch slot after the main one (strata/program/mrope_regions.hpp): a slot's rows pass
+// SessionState::mrope_base + cell (the verifier's batch staging, the indexer's pos_base, the slot drafter), so image
+// and text slots decode side by side, each at its own positions.  A kernel that derives a rope position from a cell
+// must add that base too (the indexer's pooled key does, through pos_base); its block_pos then records base + 4b,
+// metadata no kernel reads.  The pointer must be set before any CUDA graph is captured (kernels take it as an
+// argument); the contents may change between requests.
 #pragma once
 
 #include <cstdint>

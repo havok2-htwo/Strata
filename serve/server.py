@@ -278,8 +278,9 @@ def read_load_peak(path, key: str | None) -> float:
 # still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
 # STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
 ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
-# --batch with images: how long an image request waits for the slots before it to finish (it runs alone, and new
-# requests wait behind it) before it gives up with a 503 the client can retry.  STRATA_IMAGE_WAIT_S (0 = no limit).
+# --batch with images, on an engine without per-slot M-RoPE tables (no INFO mrope_slots=1): how long an image request
+# waits for the slots before it to finish (it runs alone, and new requests wait behind it) before it gives up with a 503
+# the client can retry.  STRATA_IMAGE_WAIT_S (0 = no limit).
 IMAGE_WAIT_S = _timeout_env("STRATA_IMAGE_WAIT_S", 120.0) or 0.0
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
@@ -932,6 +933,7 @@ class StrataEngine:
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
         (PR #637)."""
         info = dict(self.info)
+        info.pop("mrope_slots", None)            # the new engine says it again, or not (its slot tables may not fit)
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
             self.close()
@@ -1410,11 +1412,19 @@ class StrataEngine:
                 beat = time.monotonic()
                 yield None
 
+    def image_alone(self) -> bool:
+        """--batch: whether an image request needs the engine alone (_generate_alone).  An engine that keeps one M-RoPE
+        position table per slot (INFO mrope_slots=1) decodes image and text slots side by side, so its image requests
+        go through the batch like any other (GENI alone, BGENI into a slot).  One without it (an older engine, the slot
+        tables did not fit, another backend) refuses an image beside other slots: the request then waits for the engine
+        alone."""
+        return not (self.info or {}).get("mrope_slots")
+
     def _generate_alone(self, ids, max_new, sampling, cancel, embeddings):
-        """--batch, a request with an image: the engine's M-RoPE table (the image's positions) is one per GPU and is
-        rebuilt at every admission, while each batch row reads it at its own slot's position - an image decoding next
-        to other slots gave them its positions, and itself theirs (silently wrong text).  Until the engine keeps one
-        per slot, an image request has the engine alone for its whole run: it queues behind the image requests before
+        """--batch, a request with an image, on an engine without per-slot M-RoPE tables (image_alone): its table (the
+        image's positions) is one per GPU and is rebuilt at every admission, while each batch row reads it at its own
+        slot's position - an image decoding next to other slots gave them its positions, and itself theirs (silently
+        wrong text).  So an image request has the engine alone for its whole run: it queues behind the image requests before
         it (image_line); from its arrival no new request is admitted, the ones in slots decode to their end, then it
         takes the control lines with every slot free and keeps them to its DONE (GENI on the solo path; never moved
         into a slot, since nothing it waits for STOPs it, and no read gives way to it)."""
@@ -1494,7 +1504,7 @@ class StrataEngine:
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
-        if embeddings:                                  # an image: alone in the engine (see _generate_alone)
+        if embeddings and self.image_alone():           # an image: alone in the engine (see _generate_alone)
             yield from self._generate_alone(ids, max_new, sampling, cancel, embeddings)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
