@@ -229,6 +229,13 @@ inline bool conversation_checkpoint_same(const ConversationCheckpoint& a, const 
         if (!conversation_checkpoint_same(a.stage_parts[i], b.stage_parts[i])) return false;
     return true;
 }
+/// A dropped checkpoint made ready for reuse (STRATA_CKPT_POOL): its tokens, pictures and every run-time mark
+/// cleared (stage parts too), its running-state vectors kept for the next save to write into.  slot_turn is cleared
+/// too: a recycled slot-turn checkpoint taken for a main-session save was otherwise left out of slot chains.
+inline void conversation_checkpoint_clear_marks(ConversationCheckpoint& c) {
+    c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false; c.slot_turn = false;
+    for (ConversationCheckpoint& part : c.stage_parts) conversation_checkpoint_clear_marks(part);
+}
 inline bool conversation_kv_same(const ConversationKv& a, const ConversationKv& b) {
     return a.format == b.format && a.cells == b.cells && a.heads == b.heads && a.head_dim == b.head_dim &&
            a.page_size == b.page_size && a.pooled_rows == b.pooled_rows && a.idx_dim == b.idx_dim &&

@@ -1694,10 +1694,7 @@ public:
         v.erase(v.begin() + (std::ptrdiff_t) w, v.end());
     }
 private:
-    static void clear_marks(ConvCheckpoint& c) {
-        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false;
-        for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
-    }
+    static void clear_marks(ConvCheckpoint& c) { strata::core::conversation_checkpoint_clear_marks(c); }
     bool on_;
     size_t cap_;
     std::mutex mu_;

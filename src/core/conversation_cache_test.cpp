@@ -546,5 +546,28 @@ int main() {
         check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 10, 11, 12}, {}, false).tokens == 6, "the other mode stays");
         check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 10, 11, 12}, {{2, 77}}, true).tokens == 6, "the picture stays");
     }
+    {   // STRATA_CKPT_POOL: a recycled checkpoint keeps its state vectors but none of its marks, slot_turn included
+        ConversationCheckpoint c;
+        c.ids = {1, 2, 3};
+        c.imgs = {{1, 9}};
+        c.gdn.resize(32, 5);
+        c.used = 7; c.pinned = true; c.slot_turn = true;
+        ConversationCheckpoint part = c;
+        c.stage_parts = {part, part};
+        conversation_checkpoint_clear_marks(c);
+        check(c.ids.empty() && c.imgs.empty() && c.used == 0 && !c.pinned && !c.slot_turn,
+              "a recycled checkpoint has no tokens, pictures or marks (slot_turn too)");
+        check(c.gdn.size() == 32, "its running-state vectors are kept for the next save");
+        bool parts_clear = c.stage_parts.size() == 2;
+        for (const auto& p : c.stage_parts)
+            parts_clear = parts_clear && p.ids.empty() && p.imgs.empty() && p.used == 0 && !p.pinned && !p.slot_turn &&
+                          p.gdn.size() == 32;
+        check(parts_clear, "its stage parts are cleared alike, their vectors kept");
+        // a main-session checkpoint saved into it is not taken for a slot's turn checkpoint (left out of a chain)
+        std::vector<ConversationCheckpoint> chain{c};
+        chain[0].ids = {1, 2};
+        check(conversation_checkpoints_stage_copy(chain, 2, 0, true).size() == 1,
+              "a reused checkpoint stays in a slot image's chain");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
