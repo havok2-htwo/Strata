@@ -3716,6 +3716,11 @@ class Service:
         self.embeddings.path = None
         images = images_of(messages)
         if images:
+            last_a = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+            where = [f"{i}:{m.get('role')}" for i, m in enumerate(messages) if isinstance(m.get("content"), list)
+                     and any(isinstance(x, dict) and x.get("type") == "image" for x in m["content"])]
+            print(f"[strata] image request: {len(images)} picture(s) in messages {', '.join(where)} of {len(messages)} "
+                  f"(last assistant turn: {last_a}), {len(ids)} tokens", flush=True)
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
