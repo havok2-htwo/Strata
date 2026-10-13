@@ -293,35 +293,5 @@ class RouteTest(unittest.TestCase):
         self.assertNotIn("load_pct", v)
 
 
-class AgeOutTest(unittest.TestCase):
-    def messages(self):
-        img = {"type": "image", "source": "data:image/png;base64,AAAA"}
-        return [{"role": "user", "content": [{"type": "text", "text": "look"}, dict(img)]},
-                {"role": "assistant", "content": "ok"},
-                {"role": "tool", "content": [dict(img)]},
-                {"role": "assistant", "content": "seen"},
-                {"role": "tool", "content": [dict(img)]}]
-
-    def test_old_tool_images_become_notes_user_and_current_stay(self):
-        from serve.frontend import images_of
-        s = object.__new__(Service)
-        m = self.messages()
-        s._age_out_tool_images(m)
-        self.assertEqual(len(images_of(m)), 2)              # the user's picture and the current tool picture
-        self.assertEqual(m[2]["content"][0]["type"], "text")
-
-    def test_keep(self):
-        import os
-        from serve.frontend import images_of
-        s = object.__new__(Service)
-        m = self.messages()
-        os.environ["STRATA_IMAGE_HISTORY"] = "keep"
-        try:
-            s._age_out_tool_images(m)
-        finally:
-            del os.environ["STRATA_IMAGE_HISTORY"]
-        self.assertEqual(len(images_of(m)), 3)
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -3789,28 +3789,56 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
-    def _age_out_tool_images(self, messages):
-        """Pictures a tool returned (an agent's Read of a screenshot) in turns the model has already answered become a
-        short note.  Clients resend the whole history every turn, so one such picture made every later request of the
-        conversation an image request, and an image request runs alone: it waits for every slot to finish and holds the
-        others back (one every ~3 min in production).  The picture of the turn being answered stays; pictures a user
-        sends stay (a follow-up question may be about them).  STRATA_IMAGE_HISTORY=keep turns this off."""
-        if os.environ.get("STRATA_IMAGE_HISTORY") == "keep":
-            return
-        last = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
-        for m in messages[:last]:
-            content = m.get("content")
-            if m.get("role") != "tool" or not isinstance(content, list):
+    IMAGE_AGED = "[image omitted: a picture from an earlier turn]"
+
+    @staticmethod
+    def _answered_upto(messages) -> int:
+        """The last assistant message before the turn being answered (-1: none).  A trailing assistant message (a
+        prefill the client wants continued) belongs to that turn: the pictures in front of it are what it is about."""
+        end = len(messages) - 1 if messages and messages[-1].get("role") == "assistant" else len(messages)
+        return max((i for i in range(end) if messages[i].get("role") == "assistant"), default=-1)
+
+    def _age_out_tool_images(self, messages) -> int:
+        """Opt-in (STRATA_IMAGE_HISTORY; unset, "keep" or "0": every picture stays, as in the last release): pictures
+        of turns the model has already answered become a short note -> how many did.  Clients resend the whole history
+        every turn, so one such picture made every later request of the conversation an image request, and without
+        the per-slot M-RoPE regions (INFO mrope_slots) an image request runs alone: it waits for every slot to finish
+        and holds the others back.  The pictures of the turn being answered always stay.  Once a picture is a note it
+        stays one (the answered part of a conversation only grows), so the prompt changes once, where the picture was.
+
+        STRATA_IMAGE_HISTORY=tools: pictures a tool returned (an agent's Read of a screenshot).  STRATA_IMAGE_HISTORY=<N>
+        goes further: a picture in the user message right after tool results (OpenAI's tool messages take text only, so
+        Codex's view_image, opencode and a picture beside an Anthropic tool_result arrive there) is a tool's, and every
+        other picture a user sent becomes a note once N assistant turns have answered it (an agent session that starts
+        with screenshots made every turn of it run alone; the model no longer sees them).  Without an encoder nothing
+        is aged: _note_unreadable_tool_images' note is the same every turn, so the prompt does not change."""
+        mode = (os.environ.get("STRATA_IMAGE_HISTORY") or "").strip().lower()
+        user_after = int(mode) if mode.isdigit() and int(mode) > 0 else None
+        if (mode != "tools" and user_after is None) or self.vision is None:
+            return 0
+        aged = answered = 0
+        for i in range(self._answered_upto(messages), -1, -1):
+            m = messages[i]
+            role, content = m.get("role"), m.get("content")
+            if role == "assistant":
+                answered += 1                         # the assistant turns after every message below this one
+                continue
+            if not isinstance(content, list):
+                continue
+            if role != "tool" and not (role == "user" and user_after is not None and
+                                       (answered >= user_after or (i > 0 and messages[i - 1].get("role") == "tool"))):
                 continue
             for n, item in enumerate(content):
                 if isinstance(item, dict) and item.get("type") == "image":
-                    content[n] = {"type": "text", "text": "[image omitted: a picture from an earlier turn]"}
+                    content[n] = {"type": "text", "text": self.IMAGE_AGED}
+                    aged += 1
+        return aged
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
-        self._age_out_tool_images(messages)
+        aged = self._age_out_tool_images(messages)
         fetched = self._note_unreadable_tool_images(messages)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
@@ -3818,11 +3846,6 @@ class Service:
         self.embeddings.path = None
         images = images_of(messages)
         if images:
-            last_a = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
-            where = [f"{i}:{m.get('role')}" for i, m in enumerate(messages) if isinstance(m.get("content"), list)
-                     and any(isinstance(x, dict) and x.get("type") == "image" for x in m["content"])]
-            print(f"[strata] image request: {len(images)} picture(s) in messages {', '.join(where)} of {len(messages)} "
-                  f"(last assistant turn: {last_a}), {len(ids)} tokens", flush=True)
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
@@ -3859,6 +3882,16 @@ class Service:
             if k != len(encoded):
                 raise ValueError("the prompt and its images do not match")
             ids = out
+            # which messages make this an image request (indices and roles only, never content), the prompt's length
+            # with the pictures' rows, and what was left out: with --batch it runs alone (see _generate_alone)
+            where = [f"{i}:{m.get('role')}" for i, m in enumerate(messages) if isinstance(m.get("content"), list)
+                     and any(isinstance(x, dict) and x.get("type") == "image" for x in m["content"])]
+            shown = ", ".join(where[:8]) + (f" and {len(where) - 8} more" if len(where) > 8 else "")
+            print(f"[strata] image request: {len(images)} picture(s) in messages {shown} of {len(messages)} "
+                  f"(answered up to {self._answered_upto(messages)}), {len(ids):,} tokens with them"
+                  + (f"; {aged} older picture(s) left out" if aged else ""), flush=True)
+        elif aged:
+            print(f"[strata] {aged} older picture(s) left out: a text request", flush=True)
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
