@@ -3687,10 +3687,28 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
+    def _age_out_tool_images(self, messages):
+        """Pictures a tool returned (an agent's Read of a screenshot) in turns the model has already answered become a
+        short note.  Clients resend the whole history every turn, so one such picture made every later request of the
+        conversation an image request, and an image request runs alone: it waits for every slot to finish and holds the
+        others back (one every ~3 min in production).  The picture of the turn being answered stays; pictures a user
+        sends stay (a follow-up question may be about them).  STRATA_IMAGE_HISTORY=keep turns this off."""
+        if os.environ.get("STRATA_IMAGE_HISTORY") == "keep":
+            return
+        last = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+        for m in messages[:last]:
+            content = m.get("content")
+            if m.get("role") != "tool" or not isinstance(content, list):
+                continue
+            for n, item in enumerate(content):
+                if isinstance(item, dict) and item.get("type") == "image":
+                    content[n] = {"type": "text", "text": "[image omitted: a picture from an earlier turn]"}
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
+        self._age_out_tool_images(messages)
         fetched = self._note_unreadable_tool_images(messages)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
