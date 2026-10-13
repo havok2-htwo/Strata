@@ -243,6 +243,34 @@ def _timeout_env(name: str, default: float) -> float | None:
     return None if v <= 0 else v
 
 
+def positive_float(value) -> float:
+    """A finite number above 0, else 0.0 (a bad env value or file entry is "not set", never nan or inf)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if math.isfinite(v) and v > 0 else 0.0
+
+
+def load_peak_key(cfg: dict) -> str:
+    """GET /v1/load: what a load peak was measured with - the engine, its arguments and environment, the slots and the
+    cards.  A peak measured with another engine or config (production.json pointed elsewhere) is not this one's 100 %."""
+    keep = {k: cfg.get(k) for k in ("exe", "args", "env", "parallel", "gpu", "layer_split")}
+    return hashlib.sha256(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def read_load_peak(path, key: str | None) -> float:
+    """The peak a file keeps, 0.0 when there is none: unreadable, not a number above 0, or measured with another
+    config (a file without "config" - one written by hand - is taken)."""
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+        peak = positive_float(d["peak_tok_s"])
+        other = d.get("config") not in (None, key)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return 0.0
+    return 0.0 if other else peak
+
+
 # #1317 part 2: the quick watchdog for a FROZEN engine.  engine_silence_s (above) is generous on purpose: a slow PC reads a
 # prompt chunk for minutes without a line.  But an engine that prints nothing for ENGINE_STALL_S and also uses no CPU time and
 # moves no bytes of I/O in that time is not slow, it is idle or frozen (a deadlock in a CUDA call, a driver stall, a lost
@@ -620,6 +648,7 @@ class StrataEngine:
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    standing = 0                         # new requests standing back while an image request has the engine (/v1/load)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -1247,12 +1276,15 @@ class StrataEngine:
         the image request waits for).  `quiet`: the image request itself, never counted as waiting (a solo request is
         not moved into a slot for it, and no read gives way to it)."""
         entry = [plen]
-        counted = False
+        counted = stood = False                         # stood: standing back for an image request (/v1/load counts it)
         with self.slot_cv:
             if not quiet and not (new and self.image_line):
                 self.waiting += 1
                 self.wait_lens.append(entry)
                 counted = True
+            elif not quiet:
+                self.standing += 1
+                stood = True
         beat = time.monotonic()
         try:
             while True:
@@ -1268,11 +1300,16 @@ class StrataEngine:
                             if entry in self.wait_lens:
                                 self.wait_lens.remove(entry)
                             counted = False
+                            self.standing += 1
+                            stood = True
                             self.slot_cv.notify_all()
                         elif not self.image_line and not counted:
                             self.waiting += 1
                             self.wait_lens.append(entry)
                             counted = True
+                            if stood:
+                                self.standing = max(0, self.standing - 1)
+                                stood = False
                 with self.slot_cv:
                     turn = (counted or quiet) and (after_epoch is None or self.ctl_epoch > after_epoch or
                                                    self.waiting <= 1)
@@ -1296,10 +1333,24 @@ class StrataEngine:
                     self.waiting = max(0, self.waiting - 1)
                     if entry in self.wait_lens:
                         self.wait_lens.remove(entry)
+                if stood:
+                    self.standing = max(0, self.standing - 1)
         with self.slot_cv:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
         return True
+
+    def load_counts(self) -> dict:
+        """GET /v1/load: the admission state in one read - slots taken (a reserved or ending one included), requests
+        waiting for the control lines, for a slot, standing back for an image request, and the image requests in
+        line (the first one has, or waits for, the engine alone)."""
+        cv = self.__dict__.get("slot_cv")
+        if cv is None:                                  # never started
+            return {"slots_busy": 0, "waiting": 0, "admitting": 0, "standing": 0, "image_line": 0}
+        with cv:
+            return {"slots_busy": sum(1 for b in self.slot_busy if b), "waiting": int(self.waiting),
+                    "admitting": int(self.admitting), "standing": int(self.standing),
+                    "image_line": len(self.image_line)}
 
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
@@ -3002,7 +3053,7 @@ class Service:
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
-        self.load_peak = 0.0                             # GET /v1/load: the highest summed tok/s seen (the 100 % mark)
+        self.load_peak = 0.0                             # GET /v1/load: the highest SUSTAINED tok/s (the 100 % mark)
         self.load_peak_path = None                       # ... kept here between runs (set from the run config)
         self._load_peak_saved = (0.0, 0.0)               # (value, time) of the last write
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
@@ -3390,49 +3441,100 @@ class Service:
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
 
     LOAD_PEAK_SAVE_S = 60.0     # the peak file is written at most this often, and only when the peak rose by 2 %
+    LOAD_SUSTAIN_S = 10.0       # the 100 % mark: the highest token rate HELD this long (a 1-s figure can be a burst)
+    LOAD_NOW_S = 3.0            # load_pct's tok/s: the same count over the last few seconds
+    tokens_out = 0              # every token a request got, all requests together (_note adds them)
+    load_peak_key = None        # what the peak was measured with (main(): the run config's engine keys)
+    load_rate = None            # the counted tok/s over LOAD_NOW_S (None: no telemetry sample yet)
 
     def _load_sample(self) -> float:
-        """The summed tok/s now (the telemetry calls this once a second); raises the load peak when it is a new high."""
-        rate = self._tok_s()
-        if rate > self.load_peak:
-            self.load_peak = rate
-            saved, at = self._load_peak_saved
-            if self.load_peak_path and rate > saved * 1.02 and time.time() - at >= self.LOAD_PEAK_SAVE_S:
-                try:
-                    Path(self.load_peak_path).write_text(json.dumps({"peak_tok_s": round(rate, 1), "at": time.time()}))
-                except OSError:
-                    pass
-                self._load_peak_saved = (rate, time.time())
-        return rate
+        """The telemetry calls this once a second: returns the live tok/s (the Monitor's series, as before) and raises
+        the load peak from the token count over the last LOAD_SUSTAIN_S - only while at least half the slots decoded
+        the whole time (one request's speed is not the server's capacity), so a burst a stalled consumer reads at once
+        is spread over the window instead of being taken as a rate."""
+        now = time.time()
+        with self.status_lock:
+            out = self.tokens_out
+            many = [st for st, _ in self.live_reqs.values()] or [self.status]
+            dec = sum(1 for st in many if st.get("busy") and st.get("first_token"))
+            win = self.__dict__.setdefault("_load_win", collections.deque())
+            win.append((now, out, dec))
+            while now - win[0][0] > self.LOAD_SUSTAIN_S + 0.5:
+                win.popleft()
+            recent = next((w for w in win if now - w[0] <= self.LOAD_NOW_S + 0.5), win[-1])
+            self.load_rate = (out - recent[1]) / (now - recent[0]) if now - recent[0] >= 1.0 else self.load_rate
+            span = now - win[0][0]
+            need = max(1, (int(getattr(self.engine, "batch", 0) or 0) + 1) // 2)
+            sustained = (out - win[0][1]) / span if span >= self.LOAD_SUSTAIN_S - 1.5 and \
+                min(w[2] for w in win) >= need else 0.0
+        if sustained > self.load_peak:
+            self.load_peak = sustained
+        saved, at = self._load_peak_saved
+        if self.load_peak_path and self.load_peak > saved * 1.02 and now - at >= self.LOAD_PEAK_SAVE_S:
+            self._save_load_peak(now)       # (checked every second: a rise inside the 60 s is written later, not lost)
+        return self._tok_s()
+
+    def _save_load_peak(self, now: float) -> None:
+        path = Path(self.load_peak_path)
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)      # (STRATA_LOAD_PEAK_FILE may name a new folder)
+            tmp.write_text(json.dumps({"peak_tok_s": round(self.load_peak, 1), "at": round(now),
+                                       "config": self.load_peak_key}))
+            os.replace(tmp, path)           # whole or not at all: a stop during the write must not leave half a file
+        except OSError:
+            pass
+        self._load_peak_saved = (self.load_peak, now)
 
     def load_view(self) -> dict:
         """GET /v1/load: how busy the server is, for clients that can hold back work that is not urgent.
-        `load_pct` is the larger of the two shares: tok/s against the highest rate seen (or STRATA_LOAD_REF_TOK_S), and
-        slots in use against all slots.  `level`: idle < 25 %, low < 50 %, busy < 80 %, saturated from there."""
-        ref_env = os.environ.get("STRATA_LOAD_REF_TOK_S")
-        try:
-            ref = float(ref_env) if ref_env else 0.0
-        except ValueError:
-            ref = 0.0
+        `load_pct` is the larger of two shares: the counted tok/s against the highest rate held for LOAD_SUSTAIN_S with
+        half the slots or more decoding (or STRATA_LOAD_REF_TOK_S; none known yet: not used), and the slots taken
+        against all slots - all of them while an image request has, or waits for, the engine alone (nothing new is
+        admitted then).  `level`: idle < 25 %, low < 50 %, busy < 80 %, saturated from there.  `slots.waiting`: the
+        requests that wait - for the control lines, for a slot, behind an image request, or before they are
+        registered - each counted once; `would_wait`: a new request would wait now."""
+        ref = positive_float(os.environ.get("STRATA_LOAD_REF_TOK_S"))
         rate = self._tok_s()
-        peak = ref if ref > 0 else max(self.load_peak, rate)
-        total = int(getattr(self.engine, "batch", 0) or 0) or 1
+        e = self.engine
+        par = int(getattr(e, "batch", 0) or 0)
+        total = par or 1
         with self.status_lock:
             live = [dict(st) for st, _ in self.live_reqs.values()] or ([dict(self.status)] if self.status.get("busy") else [])
-        decoding = sum(1 for st in live if st.get("first_token"))
-        reading = len(live) - decoding
-        busy = min(total, len(live))
-        waiting = int(getattr(self.engine, "waiting", 0) or 0)
-        tok_share = rate / peak if peak > 0 else 0.0
-        slot_share = busy / total
+            before = int(self.status.get("queued") or 0)         # not registered yet: the single turn, a model load
+        # (looked up on the class: ReplicaEngine would hand a GET thread replica 0's; it sums `waiting` itself)
+        c = e.load_counts() if par and hasattr(type(e), "load_counts") else \
+            {"waiting": int(getattr(e, "waiting", 0) or 0)}
+        image_line, slots_busy = int(c.get("image_line", 0)), int(c.get("slots_busy", 0))
+        exclusive = image_line > 0
+        # registered requests that wait (each is in live_reqs from before engine.generate, first_token None): for the
+        # control lines, for a slot, standing back, the image requests behind the first - and the first one too while
+        # the slots before it still decode (it takes the engine only once every slot is free)
+        queued = (int(c.get("waiting", 0)) + int(c.get("admitting", 0)) + int(c.get("standing", 0)) +
+                  max(0, image_line - 1) + int(exclusive and slots_busy > 0))
+        running = min(total, max(0, len(live) - queued))         # in a slot, or the one on the solo path
+        decoding = min(running, sum(1 for st in live if st.get("first_token")))
+        taken = max(running, min(total, slots_busy))           # (a reserved or ending slot is taken too)
+        free = 0 if exclusive else max(0, total - taken)
+        waiting = queued + before
+        peak = ref or self.load_peak
+        counted = self.load_rate if self.load_rate is not None else rate
+        tok_share = min(1.0, counted / peak) if peak else 0.0
+        slot_share = 1.0 if exclusive else taken / total
         load = min(1.0, max(tok_share, slot_share))
         level = "idle" if load < 0.25 else "low" if load < 0.5 else "busy" if load < 0.8 else "saturated"
-        return {"load_pct": round(100 * load), "level": level,
-                "slots": {"total": total, "busy": busy, "decoding": decoding, "reading_prompt": reading,
-                          "free": max(0, total - busy), "waiting": waiting},
-                "tok_s": {"now": round(rate, 1), "peak": round(peak, 1), "share_pct": round(100 * min(1.0, tok_share))},
-                "advice": ("run now" if level in ("idle", "low") else
-                           "defer non-urgent work" if level == "busy" or waiting == 0 else "defer, requests are queueing"),
+        loaded = self.loaded()                                 # unloaded: a request waits for the model load first
+        would_wait = exclusive or waiting > 0 or free == 0 or not loaded
+        return {"load_pct": round(100 * load), "level": level, "would_wait": would_wait, "image_alone": exclusive,
+                "loaded": loaded,
+                "slots": {"total": total, "busy": running, "decoding": decoding, "reading_prompt": running - decoding,
+                          "free": free, "waiting": waiting},
+                "tok_s": {"now": round(rate, 1), "peak": round(peak, 1) if peak else None,
+                          "share_pct": round(100 * tok_share) if peak else None},
+                "server_load": len(live) + before,            # vLLM's GET /load figure: requests in flight, queued too
+                "advice": ("defer, an image request has the engine alone" if exclusive else
+                           "defer, requests are queueing" if waiting else
+                           "run now" if level in ("idle", "low") and not would_wait else "defer non-urgent work"),
                 "time": time.time()}
 
     def _tok_s(self):
@@ -3877,6 +3979,7 @@ class Service:
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
             s = self.status if st is None else st
+            self.tokens_out += max(0, n - (s.get("generated") or 0))   # GET /v1/load: every request's tokens, counted
             s["generated"] = n
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
@@ -6642,13 +6745,13 @@ def main() -> int:
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+        # GET /v1/load's 100 % mark from last time (STRATA_LOAD_PEAK_FILE: kept elsewhere, e.g. out of a git checkout)
+        svc.load_peak_path = os.environ.get("STRATA_LOAD_PEAK_FILE") or \
+            str(Path(a.config).with_suffix("")) + ".load-peak.json"
+        svc.load_peak_key = load_peak_key(cfg)
+        svc.load_peak = read_load_peak(svc.load_peak_path, svc.load_peak_key)
+        svc._load_peak_saved = (svc.load_peak, time.time())
     if a.config:                                        # the Chat settings shared with other apps, from last time
-        svc.load_peak_path = str(Path(a.config).with_suffix("")) + ".load-peak.json"
-        try:
-            svc.load_peak = svc._load_peak_saved = float(json.loads(Path(svc.load_peak_path).read_text())["peak_tok_s"])
-            svc._load_peak_saved = (svc.load_peak, time.time())
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
             svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
