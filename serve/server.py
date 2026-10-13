@@ -250,6 +250,9 @@ def _timeout_env(name: str, default: float) -> float | None:
 # still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
 # STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
 ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
+# --batch with images: how long an image request waits for the slots before it to finish (it runs alone, and new
+# requests wait behind it) before it gives up with a 503 the client can retry.  STRATA_IMAGE_WAIT_S (0 = no limit).
+IMAGE_WAIT_S = _timeout_env("STRATA_IMAGE_WAIT_S", 120.0) or 0.0
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
 
@@ -347,6 +350,11 @@ class EngineStuck(RuntimeError):
 class GpuBusy(RuntimeError):
     """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
     model server) is using it, so the engine is not started into the little that is left."""
+
+
+class ImageWaitTimeout(GpuBusy):
+    """--batch: an image request waited longer than STRATA_IMAGE_WAIT_S for the engine alone (the slots before it were
+    still decoding): a 503 the client can retry, and the text requests held behind it go on."""
 
 
 ENGINE_REQUEST = re.compile(
@@ -783,6 +791,7 @@ class StrataEngine:
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
+            self.image_line: list[object] = []          # image requests waiting for (or having) the engine alone
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
@@ -1229,13 +1238,21 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
+    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False,
+                      quiet: bool = False):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
-        `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
+        `after_epoch`: a request whose read gave way lets the requests waiting then go first.  `new`: a request not
+        admitted yet - while an image request waits for the engine alone, or has it (image_line), it stands back and
+        is not counted as waiting meanwhile (a read that gave way to it would otherwise wait for it, holding the slot
+        the image request waits for).  `quiet`: the image request itself, never counted as waiting (a solo request is
+        not moved into a slot for it, and no read gives way to it)."""
         entry = [plen]
+        counted = False
         with self.slot_cv:
-            self.waiting += 1
-            self.wait_lens.append(entry)
+            if not quiet and not (new and self.image_line):
+                self.waiting += 1
+                self.wait_lens.append(entry)
+                counted = True
         beat = time.monotonic()
         try:
             while True:
@@ -1244,13 +1261,27 @@ class StrataEngine:
                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
                     # restart is under way it keeps waiting and goes on with the new engine.
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
+                if new:
+                    with self.slot_cv:
+                        if self.image_line and counted:     # an image request came: stand back until it is done
+                            self.waiting = max(0, self.waiting - 1)
+                            if entry in self.wait_lens:
+                                self.wait_lens.remove(entry)
+                            counted = False
+                            self.slot_cv.notify_all()
+                        elif not self.image_line and not counted:
+                            self.waiting += 1
+                            self.wait_lens.append(entry)
+                            counted = True
                 with self.slot_cv:
-                    turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
+                    turn = (counted or quiet) and (after_epoch is None or self.ctl_epoch > after_epoch or
+                                                   self.waiting <= 1)
                 if turn and self.ctl.acquire(timeout=0.5):
-                    if self.alive():
+                    if self.alive() and not (new and self.image_line):
                         break
                     self.ctl.release()                  # it died (or is being restarted) while this one was getting
-                    turn = False                        # the lines: not the engine this request was meant for
+                    turn = False                        # the lines: not the engine this request was meant for (or
+                                                        # an image request came meanwhile: it goes first)
                 if not turn:
                     with self.slot_cv:
                         self.slot_cv.wait(timeout=0.5)
@@ -1261,9 +1292,10 @@ class StrataEngine:
                     yield None
         finally:
             with self.slot_cv:
-                self.waiting = max(0, self.waiting - 1)
-                if entry in self.wait_lens:
-                    self.wait_lens.remove(entry)
+                if counted:
+                    self.waiting = max(0, self.waiting - 1)
+                    if entry in self.wait_lens:
+                        self.wait_lens.remove(entry)
         with self.slot_cv:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
@@ -1277,7 +1309,8 @@ class StrataEngine:
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
         slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
-                not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
+                not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0" or
+                self.image_line):                       # an image request waits for the slots to finish
             return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
@@ -1286,6 +1319,118 @@ class StrataEngine:
         """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
+
+    def _take_engine_alone(self, cancel, me, plen: int):
+        """The image request `me` (in image_line): waits for its turn among the image requests and for every slot to
+        be free, then takes the control lines, yielding None heartbeats.  True: it holds them and no slot is busy;
+        False: cancelled.  It waits for the slots without the control lines: a read that gave way (BYIELD) holds a
+        slot and needs them to go on (waiting with them is the deadlock of ENGINE_REVIEW finding 1)."""
+        beat = since = time.monotonic()
+        said = False
+        while True:
+            if not self.alive() and not getattr(self, "starting", False):
+                raise EngineDied("the engine stopped while this request waited; it was not sent")
+            if IMAGE_WAIT_S > 0 and time.monotonic() - since >= IMAGE_WAIT_S:
+                raise ImageWaitTimeout(f"an image request runs alone and the other requests did not finish within "
+                                       f"{IMAGE_WAIT_S:.0f} s (STRATA_IMAGE_WAIT_S); try again")
+            with self.slot_cv:
+                first = bool(self.image_line) and self.image_line[0] is me
+                if first and any(self.slot_busy):
+                    self._reap_orphan_slots()           # (#1603: a busy flag nobody owns would hold it for good)
+                ready = first and not any(self.slot_busy)
+                if first and not ready and not said:
+                    said = True
+                    print(f"[strata] parallel: an image request waits for {sum(map(bool, self.slot_busy))} busy "
+                          "slot(s) to finish (it runs alone); new requests wait behind it", flush=True)
+                if not ready:
+                    self.slot_cv.wait(timeout=0.5)
+            if ready:
+                ok = yield from self._take_control(cancel, plen, quiet=True)
+                if not ok:
+                    return False
+                with self.slot_cv:
+                    if not any(self.slot_busy):
+                        return True
+                self.ctl.release()                      # a request that had the lines took a slot meanwhile
+                continue
+            if cancel.is_set():
+                return False
+            if time.monotonic() - beat >= 10.0:         # a heartbeat every 10 s, as _take_control
+                beat = time.monotonic()
+                yield None
+
+    def _generate_alone(self, ids, max_new, sampling, cancel, embeddings):
+        """--batch, a request with an image: the engine's M-RoPE table (the image's positions) is one per GPU and is
+        rebuilt at every admission, while each batch row reads it at its own slot's position - an image decoding next
+        to other slots gave them its positions, and itself theirs (silently wrong text).  Until the engine keeps one
+        per slot, an image request has the engine alone for its whole run: it queues behind the image requests before
+        it (image_line); from its arrival no new request is admitted, the ones in slots decode to their end, then it
+        takes the control lines with every slot free and keeps them to its DONE (GENI on the solo path; never moved
+        into a slot, since nothing it waits for STOPs it, and no read gives way to it)."""
+        self.progress, self.progress_ms, self.reused = None, 0, 0
+        keys = self.sampling_keys(sampling or {})
+        out: list[int] = []
+        pending: list[int] = []
+        me = object()
+        with self.slot_cv:
+            self.image_line.append(me)
+            self.slot_cv.notify_all()
+        holding, born, phase = False, self.gen, "none"
+        try:
+            for attempt in range(3):
+                ok = yield from self._take_engine_alone(cancel, me, len(ids))
+                if not ok:
+                    return
+                holding, born = True, self.gen
+                btrace("ctl acquired (alone, an image)")
+                self._last_done = None                  # (#879: this request's DONE decides below)
+                self._send(f"GENI {int(max_new)}{keys} {embeddings} {','.join(str(int(t)) for t in ids)}")
+                phase = "solo"
+                self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                self._ctl_erred = False
+                try:
+                    for x in self._control(cancel, pending.append):
+                        while pending:
+                            t = pending.pop(0)
+                            out.append(t)
+                            yield t
+                        if x is None:                   # a heartbeat (False: a token, flushed above)
+                            yield None
+                except ValueError as e:
+                    # the engine still had a slot decoding (its busy flag was freed here first: a BDONE wait that
+                    # timed out, a reaped orphan) and refused the picture: it changed nothing, so wait for the slots
+                    # again instead of failing the request
+                    if not (self._ctl_erred and str(e).startswith("vision:") and not out and attempt < 2):
+                        raise
+                    print(f"[strata] parallel: the engine refused the image request ({e}); waiting for its slots",
+                          flush=True)
+                    phase, holding = "none", False
+                    self.ctl.release()
+                    continue
+                break
+            phase = "none"                              # its DONE is read
+            while pending:
+                t = pending.pop(0)
+                out.append(t)
+                yield t
+            if self._done_finish() == "nonfinite":        # #879
+                raise EngineNonFinite("the engine's logits became non-finite (#879)")
+        finally:
+            # a consumer that left early (or an error): keep the engine and this server in step, as generate_batched
+            try:
+                if phase == "solo" and (self.gen != born or not self.alive() or self._ctl_erred):
+                    phase = "none"                      # #1012 / #1059: nothing to stop or drain
+                if phase == "solo":
+                    self._send("STOP")
+                    self._drain_control("DONE", born=born)
+            except EngineDied:
+                pass
+            if holding:
+                self.ctl.release()
+            with self.slot_cv:                          # the next image request, or the requests that stood back
+                if me in self.image_line:
+                    self.image_line.remove(me)
+                self.slot_cv.notify_all()
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
@@ -1298,6 +1443,9 @@ class StrataEngine:
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        if embeddings:                                  # an image: alone in the engine (see _generate_alone)
+            yield from self._generate_alone(ids, max_new, sampling, cancel, embeddings)
+            return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
@@ -1306,7 +1454,7 @@ class StrataEngine:
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
-        ok = yield from self._take_control(cancel, len(prompt))
+        ok = yield from self._take_control(cancel, len(prompt), new=True)
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -1415,8 +1563,8 @@ class StrataEngine:
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
                                 return
-                            if not holding:
-                                ok = yield from self._take_control(cancel, len(prompt))
+                            if not holding:             # (one with nothing generated yet is not admitted yet)
+                                ok = yield from self._take_control(cancel, len(prompt), new=not out)
                                 if not ok:
                                     return
                                 holding, born = True, self.gen
@@ -2993,6 +3141,16 @@ class Service:
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
 
+    def _vision_start(self):
+        """Start a dead (or unloaded) image encoder again for a request with images; requests without images leave it
+        (see ensure_loaded).  The caller holds self.fifo."""
+        if self._vision_down():
+            print("[strata] starting the vision encoder ...", flush=True)
+            try:
+                self.vision.restart()
+            except Exception as e:
+                raise EngineDied(f"the vision encoder failed to start: {e}") from e
+
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
         be read (then nothing is refused)."""
@@ -3011,10 +3169,12 @@ class Service:
         except Exception:
             return None
 
-    def ensure_loaded(self):
+    def ensure_loaded(self, vision: bool = True):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
-        the free-VRAM check.  The caller holds self.fifo."""
-        if self.loaded() and not self._vision_down():
+        the free-VRAM check.  The caller holds self.fifo.  `vision` False: for a request without images - a dead image
+        encoder does not fail it (it is started with the engine if it can be, else only that is said; an image request
+        starts it, or gets the error)."""
+        if self.loaded() and (not vision or not self._vision_down()):
             return
         if self.before_load:
             cmd = self.before_load
@@ -3038,8 +3198,12 @@ class Service:
             try:
                 self.vision.restart()
             except Exception as e:
-                raise EngineDied(f"the vision encoder failed to start: {e}") from e
-            vision_started = True
+                if vision:
+                    raise EngineDied(f"the vision encoder failed to start: {e}") from e
+                print(f"[strata] the vision encoder failed to start ({e}); requests without images go on, the next "
+                      "one with an image tries it again", flush=True)
+            else:
+                vision_started = True
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
@@ -3100,11 +3264,13 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
-        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
+    def load(self, vision: bool = True):
+        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy).
+        `vision` False (a generation request, before its images are known): a dead image encoder does not fail it -
+        prepare() starts it for a request with images (ensure_loaded)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
-        if self.loaded() and not self._vision_down():
+        if self.loaded() and (not vision or not self._vision_down()):
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -3122,7 +3288,7 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
-                    self.ensure_loaded()
+                    self.ensure_loaded(vision=vision)
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -3463,8 +3629,9 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self.fifo:          # the encoder takes its turn with the requests (see below)
+                            self._vision_start()
                             self.vision.encode(src)
-                    except (ValueError, OSError) as e:
+                    except (ValueError, OSError, EngineDied) as e:
                         why = str(e)
                 if why is not None:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
@@ -3496,6 +3663,7 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self.fifo:
+                self._vision_start()                 # a request without images does not start a dead encoder
                 encoded = (self.vision.encode_all(images) if hasattr(self.vision, "encode_all")
                            else [self.vision.encode(src) for src in images])
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
@@ -3791,12 +3959,14 @@ class Service:
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
                     # waiting here for the fifo (an image encode, a /v1/vram resize) left it neither - and one on a
                     # loaded engine has nothing to start, so it does not wait for the fifo at all
+                    # A dead or unstartable image encoder fails only a request with images (as before): one
+                    # without images goes on without it
                     try:
                         if not par:
-                            self.ensure_loaded()
-                        elif not (self.loaded() and not self._vision_down()):
+                            self.ensure_loaded(vision=bool(emb))
+                        elif not (self.loaded() and not (emb and self._vision_down())):
                             with self.fifo:
-                                self.ensure_loaded()
+                                self.ensure_loaded(vision=bool(emb))
                     except BaseException:
                         if par:
                             with self.status_lock:
@@ -5360,7 +5530,7 @@ def make_handler(svc: Service):
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
-            svc.load()
+            svc.load(vision=False)    # (images: prepare() starts the encoder)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
@@ -5552,7 +5722,7 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
+            svc.load(vision=False)
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
@@ -5588,7 +5758,7 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
-            svc.load()
+            svc.load(vision=False)
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
