@@ -282,6 +282,15 @@ ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
 # waits for the slots before it to finish (it runs alone, and new requests wait behind it) before it gives up with a 503
 # the client can retry.  STRATA_IMAGE_WAIT_S (0 = no limit).
 IMAGE_WAIT_S = _timeout_env("STRATA_IMAGE_WAIT_S", 120.0) or 0.0
+# --batch: new requests take the control lines (one prompt read at a time) short prompts first: a prompt of at most
+# STRATA_ADMIT_SHORT_FIRST tokens goes before longer ones (opt-in; unset or 0: whoever gets the lock first), and a
+# longer one that waited STRATA_ADMIT_MAX_WAIT_S (default 30) counts as short.  A chat question then waits for the one
+# read in progress, not for every agent read that came before it.
+try:
+    ADMIT_SHORT_FIRST = max(0, int(os.environ.get("STRATA_ADMIT_SHORT_FIRST") or 0))
+except ValueError:
+    ADMIT_SHORT_FIRST = 0
+ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
 
@@ -1277,7 +1286,7 @@ class StrataEngine:
         is not counted as waiting meanwhile (a read that gave way to it would otherwise wait for it, holding the slot
         the image request waits for).  `quiet`: the image request itself, never counted as waiting (a solo request is
         not moved into a slot for it, and no read gives way to it)."""
-        entry = [plen]
+        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
         counted = stood = False                         # stood: standing back for an image request (/v1/load counts it)
         with self.slot_cv:
             if not quiet and not (new and self.image_line):
@@ -1315,7 +1324,17 @@ class StrataEngine:
                 with self.slot_cv:
                     turn = (counted or quiet) and (after_epoch is None or self.ctl_epoch > after_epoch or
                                                    self.waiting <= 1)
+                    if turn and counted and new and ADMIT_SHORT_FIRST > 0:
+                        turn = self._admit_next() is entry
                 if turn and self.ctl.acquire(timeout=0.5):
+                    if counted and new and ADMIT_SHORT_FIRST > 0:
+                        with self.slot_cv:              # a shorter one came while this one waited in acquire()
+                            first = self._admit_next() is entry
+                        if not first:
+                            self.ctl.release()
+                            with self.slot_cv:
+                                self.slot_cv.notify_all()
+                            continue
                     if self.alive() and not (new and self.image_line):
                         break
                     self.ctl.release()                  # it died (or is being restarted) while this one was getting
@@ -1341,6 +1360,18 @@ class StrataEngine:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
         return True
+
+    def _admit_next(self):
+        """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
+        next - one whose prompt is at most that long (it reads little) before a longer one, in arrival order within
+        each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
+        Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
+        now = time.monotonic()
+        ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
+        if not ordered:
+            return None
+        return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
+                                           e[1]))
 
     def load_counts(self) -> dict:
         """GET /v1/load: the admission state in one read - slots taken (a reserved or ending one included), requests
