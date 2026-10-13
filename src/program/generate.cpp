@@ -11877,6 +11877,32 @@ int main(int argc, char** argv) {
             const int64_t n = (int64_t) ids.size();
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            // --vision with --batch: the M-RoPE table below is one per device, indexed by a cell's position, and every
+            // batch row reads it at its slot's own position.  An image request's table is not the identity a text
+            // slot needs (nor another image slot's), so image and text rows never decode together: a GENI / BGENI
+            // only while no slot decodes, a GEN / BGEN not while a slot that was admitted with pictures decodes.
+            // (Before the table is touched; text-only traffic never meets either refusal.)
+            if (o.vision && !bs.empty()) {
+                int busy = -1, busy_img = -1;
+                for (size_t b = 0; b < bs.size(); ++b) {
+                    if (!bs[b].active) continue;
+                    if (busy < 0) busy = (int) b;
+                    if (busy_img < 0 && bs[b].img) busy_img = (int) b;
+                }
+                if (geni && busy >= 0) {
+                    std::printf("ERR vision: an image request is not taken while batch slot %d decodes (image and text "
+                                "rows share one M-RoPE table); try again once the slots are idle\n", busy);
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (!geni && busy_img >= 0) {
+                    std::printf("ERR vision: a text request is not taken while batch slot %d decodes an image "
+                                "request (image and text rows share one M-RoPE table); try again once it ends\n",
+                                busy_img);
+                    std::fflush(stdout);
+                    continue;
+                }
+            }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
